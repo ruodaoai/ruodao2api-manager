@@ -137,17 +137,7 @@ codebuddy/cn/gpt-5.6 # 渠道/区域/模型：只走 WorkBuddy 国内版
 - Windows 10 / 11 x64（桌面端与 Tk 管理窗口为 Windows 专用）
 - 从源码运行需要 Python 3.9+（**无需 pip install**，标准库足够）
 
-### 方式一：便携版（推荐给只想用的）
-
-从 [Releases](https://github.com/ruodaoai/ruodao2api-manager/releases) 下载 `Ruodao2API.exe`，放到任意目录双击运行。首次启动会：
-
-1. 在**程序同级目录**创建 `data/`（配置 + SQLite 数据库）；
-2. 拉起后端并占用 `127.0.0.1:8388`（若被占用会自动顺延到 8389、8390…）；
-3. 打开管理窗口。数据目录可用环境变量 `RUDAO_DATA_DIR` 改到别处。
-
-> 便携版与安装包不随仓库提交（体积过大），请自行用下面的命令构建，或使用 Release 产物。
-
-### 方式二：从源码运行
+### 方式一：从源码运行（最快上手）
 
 ```bash
 git clone https://github.com/ruodaoai/ruodao2api-manager.git
@@ -159,7 +149,7 @@ python app.py --headless # 只跑网关，不要窗口（适合开机自启）
 
 首次启动会在 `data/config.json` 里自动生成一把 `sk-ruodao-…` 主密钥，并在 `data/ruodao.db` 建库。
 
-### 方式三：自己打包
+### 方式二：打包成 EXE（想要双击即用）
 
 ```bash
 python build.py              # 后端 EXE + 便携版 + 安装包
@@ -168,6 +158,14 @@ python build.py installer    # 只出 NSIS 安装包
 ```
 
 产物：`dist/Ruodao2API-backend.exe`、`dist-electron/Ruodao2API.exe`、`dist-electron/Ruodao2API-Setup-0.1.0.exe`。
+
+便携版 `Ruodao2API.exe` 放到任意目录双击即可，首次启动会：
+
+1. 在 `%APPDATA%\Ruodao2API\data` 创建配置与 SQLite 数据库（可用 `RUDAO_DATA_DIR` 改到别处）；
+2. 拉起后端并占用 `127.0.0.1:8388`（若被占用会自动顺延到 8389、8390…）；
+3. 打开管理窗口。
+
+> **仓库不提交任何二进制产物**（体积与签名原因）：请用上面两条命令在自己的机器上产出 EXE。
 
 ---
 

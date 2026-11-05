@@ -22,13 +22,14 @@
 
 ## 1. 安装与首次启动
 
-### 1.1 三种装法
+### 1.1 两种装法
 
 | 方式 | 适合谁 | 命令 |
 | --- | --- | --- |
-| 便携版 EXE | 只想用，不想装环境 | 双击 `Ruodao2API.exe` |
-| 源码运行 | 想改代码 / 看实现 | `python app.py` |
-| 自行构建 | 想要自己的二进制 | `python build.py` |
+| 源码运行 | 想改代码 / 看实现 / 最快跑起来 | `python app.py` |
+| 打包成 EXE | 不想装 Python，想双击即用 | `python build.py`，然后双击 `dist-electron\Ruodao2API.exe` |
+
+> 仓库不提交二进制，EXE 需要你在自己机器上用 `build.py` 产出。
 
 ### 1.2 数据放哪
 
