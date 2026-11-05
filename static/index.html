@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Ruodao2API · 本地 AI 聚合网关</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="brand-mark">R</div>
+      <div class="brand-text">
+        <strong>Ruodao2API</strong>
+        <span>本地 AI 聚合网关</span>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="overview">总览</button>
+      <button class="tab" data-tab="accounts">账号<span class="count" id="tabAccountCount"></span></button>
+      <button class="tab" data-tab="models">模型</button>
+      <button class="tab" data-tab="keys">密钥<span class="count" id="tabKeyCount"></span></button>
+      <button class="tab" data-tab="usage">用量</button>
+      <button class="tab" data-tab="guard">防护</button>
+      <button class="tab" data-tab="logs">日志</button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+    <div class="top-actions">
+      <span class="status-pill" id="gatewayPill"><i class="dot"></i><span>运行中</span></span>
+      <button class="btn ghost sm" id="refreshAll">刷新</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="view active" id="view-overview"></section>
+  <section class="view" id="view-accounts"></section>
+  <section class="view" id="view-models"></section>
+  <section class="view" id="view-keys"></section>
+  <section class="view" id="view-usage"></section>
+  <section class="view" id="view-guard"></section>
+  <section class="view" id="view-logs"></section>
+  <section class="view" id="view-settings"></section>
+</main>
+
+<div class="toasts" id="toasts"></div>
+<div id="modalRoot"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,74 @@
+{
+  "name": "ruodao2api-desktop",
+  "productName": "Ruodao2API",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ruodao2API Windows desktop shell",
+  "main": "main.js",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron .",
+    "pack": "electron-builder --win --dir",
+    "dist": "node -r ./build-retry.js ./node_modules/electron-builder/cli.js --win portable",
+    "dist:installer": "node -r ./build-retry.js ./node_modules/electron-builder/cli.js --win nsis"
+  },
+  "devDependencies": {
+    "electron": "45.2.3",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "local.ruodao2api.desktop",
+    "productName": "Ruodao2API",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "../dist-electron",
+      "buildResources": "assets"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "error.html",
+      "assets/app.ico",
+      "assets/app.png"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/Ruodao2API-backend.exe",
+        "to": "backend/Ruodao2API-backend.exe"
+      }
+    ],
+    "win": {
+      "icon": "assets/app.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Ruodao2API.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Ruodao2API",
+      "uninstallDisplayName": "Ruodao2API",
+      "installerIcon": "assets/app.ico",
+      "uninstallerIcon": "assets/app.ico",
+      "installerHeaderIcon": "assets/app.ico",
+      "artifactName": "Ruodao2API-Setup-${version}.${ext}",
+      "deleteAppDataOnUninstall": false,
+      "packElevateHelper": false
+    },
+    "portable": {
+      "artifactName": "Ruodao2API.exe"
+    }
+  },
+  "author": "Ruodao2API"
+}

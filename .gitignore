@@ -1,0 +1,37 @@
+# 运行时数据（含明文凭证，禁止入库）
+data/
+*.db
+*.db-shm
+*.db-wal
+*.pid
+ruodao-error.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.build/
+build/
+dist/
+*.spec
+
+# Node / Electron
+node_modules/
+npm-debug.log*
+yarn-error.log*
+dist-electron/
+
+# 本地截图与临时文件（docs/screenshots 才是要提交的）
+.screenshots/
+.tmp*
+*.tmp
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+vibe_images/
