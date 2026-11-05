@@ -329,6 +329,8 @@ python app.py --no-scheduler   # 本次启动不跑定时任务
 
 ### 9.2 日志级别
 
+<img src="screenshots/07-logs.png" alt="运行日志" />
+
 | 级别 | 内容 |
 | --- | --- |
 | `INFO` | 启动、账号增删、签到、刷新、访问日志 |
