@@ -35,3 +35,6 @@ dist-electron/
 Thumbs.db
 desktop.ini
 vibe_images/
+
+# 本地工作区记忆 / 工具数据
+.workbuddy/
