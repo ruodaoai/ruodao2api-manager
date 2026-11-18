@@ -39,8 +39,6 @@ DEFAULTS = {
     # 若道开源社区（评论与账号互通）
     "community_base": "https://ruodao.com",
     "community_slug": "ruodao2api",
-    "community_client_id": "",
-    "community_redirect_uri": "",
     "community_timeout": 15,
 }
 

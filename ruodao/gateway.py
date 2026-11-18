@@ -13,7 +13,6 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import util
-from .community import render_callback_page
 from .errors import UpstreamError
 from .protocols.responses import ResponseStore, ResponsesStreamTranslator
 from .protocols.translate import (
@@ -1006,40 +1005,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "guard": self.runtime.guard.snapshot()})
 
     # -- 若道开源社区 ------------------------------------------------------
-    COMMUNITY_KEYS = ("community_base", "community_slug",
-                      "community_client_id", "community_redirect_uri",
-                      "community_timeout")
-
-    def _html(self, status, text):
-        payload = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(payload)
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+    COMMUNITY_KEYS = ("community_base", "community_slug", "community_timeout")
 
     def _handle_community(self, method, path):
         """社区评论与若道账号登录。返回 True 表示请求已处理。"""
         client = self.runtime.community
-        if path == "/api/community/auth/callback" and method == "GET":
-            qs = util.query_string(self)
-            pairs = []
-            for key, values in qs.items():
-                for value in values:
-                    pairs.append("%s=%s" % (urllib.parse.quote(key),
-                                            urllib.parse.quote(value)))
-            ok, message = client.complete_auth("&".join(pairs))
-            self._html(200 if ok else 400,
-                       render_callback_page(ok, message))
-            return True
-        if path == "/api/community/auth/start" and method == "POST":
-            started = client.start_auth()
-            self._json(200, {"ok": True, "auth": started})
+        if path == "/api/community/login" and method == "POST":
+            body = self._read_json()
+            result = client.login(body.get("email"), body.get("password"))
+            self._json(200, result)
             return True
         if path == "/api/community/auth/logout" and method == "POST":
             client.logout()

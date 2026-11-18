@@ -17,8 +17,6 @@
     communityDraft: '',
     communityReply: null,
     communityPosting: false,
-    communityAuthBusy: false,
-    communityPoll: null,
     tab: 'overview',
     accountFilter: 'all',
     modelFilter: 'all',
@@ -1259,80 +1257,35 @@
     return palette[hash % palette.length];
   }
 
-  function renderCommunityComment(comment, isReply) {
-    var author = comment.author || '社区用户';
-    var replies = (comment.replies || []).map(function (reply) {
-      return renderCommunityComment(reply, true);
-    }).join('');
-    return '<article class="community-item' + (isReply ? ' reply' : '') + '">' +
-      '<span class="community-avatar" aria-hidden="true" style="--avatar:' +
-      communityColor(author) + '">' + esc(communityFirstChar(author)) + '</span>' +
-      '<div class="community-main"><div class="community-meta"><strong>' + esc(author) + '</strong>' +
-      (comment.reply_to ? '<span class="community-reply-to">回复 ' + esc(comment.reply_to) + '</span>' : '') +
-      '<small>' + esc(timeAgo(comment.created_at)) + '</small></div>' +
-      '<div class="community-body">' + esc(comment.body || '（无正文）') + '</div></div></article>' +
-      (replies ? '<div class="community-replies">' + replies + '</div>' : '');
-  }
-
-  function loadCommunity(refresh) {
-    state.communityLoading = true;
-    state.communityError = '';
-    if (!state.community) { renderCommunity(); }
-    return api('/api/community/comments' + (refresh ? '?refresh=1' : ''))
-      .then(function (data) {
-        state.community = data.community || null;
-      })
-      .catch(function (e) {
-        state.communityError = e.message;
-      })
-      .then(function () {
-        state.communityLoading = false;
-        renderTabs();
-        renderCommunity();
-        return !state.communityError;
-      });
-  }
-
   function communityAuth() {
     var data = state.community || {};
-    return data.auth || { configured: false, logged_in: false, user: null, redirect_uri: '' };
+    return data.auth || { logged_in: false, user: null, login_url: 'https://ruodao.com/login' };
   }
 
   function communityComposer() {
     var auth = communityAuth();
-    var redirect = auth.redirect_uri || '';
-    if (!auth.configured) {
-      return '<div class="card community-compose"><div class="panel-head"><h3>在本机直接发言</h3>' +
-        '<span class="pill plain">需要若道账号</span></div><div class="panel-body">' +
-        '<div class="note info">要在面板里用若道账号发评论，先在若道开放平台建一个「公开客户端」，' +
-        '回调地址填下面这个，再把 client_id 填进来。一次配置，长期有效。</div>' +
-        '<div class="field"><label>回调地址（填到开放平台）</label><div class="key-box"><code>' +
-        esc(redirect) + '</code><button class="btn sm" type="button" data-copy="' +
-        esc(redirect) + '">复制</button></div></div>' +
-        '<div class="field"><label>OAuth Client ID</label><div class="community-inline">' +
-        '<input class="input" id="setCommunityClientId" placeholder="rdapp_xxxxxxxxxxxxxxxxxxxx">' +
-        '<button class="btn primary" type="button" data-action="save-community-client">保存</button></div>' +
-        '<div class="hint">保存后点「用若道账号登录」，授权完成即可在这里发评论；' +
-        '评论会同时出现在若道社区页。令牌只存在本机数据库。</div></div>' +
-        '<div class="community-empty-actions"><a class="btn" href="https://ruodao.com/open-platform" ' +
-        'target="_blank" rel="noopener noreferrer">打开开放平台</a></div>' +
-        '</div></div>';
-    }
     if (!auth.logged_in) {
-      return '<div class="card community-compose"><div class="panel-head"><h3>在本机直接发言</h3>' +
+      return '<div class="card community-compose"><div class="panel-head"><h3>用若道账号发言</h3>' +
         '<span class="pill plain">未登录</span></div><div class="panel-body">' +
-        '<div class="note info">用若道账号登录后，就能在这里发评论和回复。评论只有一份，' +
-        '面板里发的会立刻出现在若道社区页，反过来也一样。</div>' +
+        '<div class="note info">填 ruodao.com 的登录邮箱和密码就能在这里发评论、回复。' +
+        '密码只用来换一次登录令牌，不会存在本机；令牌保存在本地数据库，随时可以退出。</div>' +
+        '<div class="community-login-grid">' +
+        '<div class="field"><label>邮箱</label><input class="input" id="communityEmail" type="email" ' +
+        'autocomplete="username" spellcheck="false" placeholder="you@example.com"></div>' +
+        '<div class="field"><label>密码</label><input class="input" id="communityPassword" type="password" ' +
+        'autocomplete="current-password" placeholder="若道账号密码"></div></div>' +
         '<div class="community-empty-actions"><button class="btn primary" type="button" ' +
-        'data-action="community-login">' + (state.communityAuthBusy ? '等待浏览器授权…' : '用若道账号登录') +
-        '</button><span class="faint">授权范围：openid · profile · app:comments</span></div>' +
+        'data-action="community-login">登录并发言</button>' +
+        '<a class="btn" href="' + esc(auth.login_url || 'https://ruodao.com/login') + '" ' +
+        'target="_blank" rel="noopener noreferrer">没有账号？去若道</a></div>' +
         '</div></div>';
     }
     var user = auth.user || {};
+    var who = user.name || user.email || '若道用户';
     var draft = state.communityDraft || '';
     var reply = state.communityReply;
     return '<div class="card community-compose"><div class="panel-head"><h3>在本机直接发言</h3>' +
-      '<span class="pill green">已登录 · ' + esc(user.name || '若道用户') + '</span>' +
+      '<span class="pill green">已登录 · ' + esc(who) + '</span>' +
       '<button class="btn sm" type="button" data-action="community-logout">退出登录</button></div>' +
       '<div class="panel-body">' +
       (reply ? '<div class="community-reply-banner">正在回复 <b>@' + esc(reply.author) + '</b>' +
@@ -2121,49 +2074,35 @@
   }
 
   function communityLogin(btn) {
-    if (state.communityAuthBusy) { return; }
+    var emailBox = $('#communityEmail');
+    var passBox = $('#communityPassword');
+    var email = emailBox ? emailBox.value.trim() : '';
+    var password = passBox ? passBox.value : '';
+    if (!email || !password) {
+      toast('请填写若道账号的邮箱和密码', 'err');
+      (email ? passBox : emailBox).focus();
+      return;
+    }
     btn.disabled = true;
-    api('/api/community/auth/start', { method: 'POST', body: {} })
+    btn.textContent = '登录中…';
+    api('/api/community/login', {
+      method: 'POST',
+      body: { email: email, password: password },
+    })
       .then(function (res) {
-        var started = res.auth || {};
-        state.communityAuthBusy = true;
-        renderCommunity();
-        window.open(started.authorize_url, '_blank', 'noopener');
-        startCommunityPoll();
+        var auth = res.auth || {};
+        var user = auth.user || {};
+        state.communityReply = null;
+        state.communityDraft = '';
+        toast('已登录：' + (user.name || email), 'ok');
+        return loadCommunity(true);
       })
       .catch(function (e) {
         toast(e.message, 'err');
         btn.disabled = false;
+        btn.textContent = '登录并发言';
+        if (passBox) { passBox.value = ''; passBox.focus(); }
       });
-  }
-
-  function startCommunityPoll() {
-    stopCommunityPoll();
-    var tries = 0;
-    state.communityPoll = setInterval(function () {
-      tries += 1;
-      api('/api/community/auth').then(function (res) {
-        var auth = res.auth || {};
-        if (auth.logged_in) {
-          stopCommunityPoll();
-          state.communityAuthBusy = false;
-          toast('已登录若道账号', 'ok');
-          loadCommunity(true);
-        } else if (tries > 90) {
-          stopCommunityPoll();
-          state.communityAuthBusy = false;
-          renderCommunity();
-          toast('没等到授权结果，可以再点一次登录', 'err');
-        }
-      }).catch(function () { /* 轮询失败忽略，下一轮重试 */ });
-    }, 2000);
-  }
-
-  function stopCommunityPoll() {
-    if (state.communityPoll) {
-      clearInterval(state.communityPoll);
-      state.communityPoll = null;
-    }
   }
 
   function communityLogout(btn) {
@@ -2215,22 +2154,6 @@
     api('/api/community/comments/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' })
       .then(function () {
         toast('评论已删除', 'ok');
-        return loadCommunity(true);
-      })
-      .catch(function (e) {
-        toast(e.message, 'err');
-        btn.disabled = false;
-      });
-  }
-
-  function saveCommunityClient(btn) {
-    var input = $('#setCommunityClientId');
-    var value = input ? input.value.trim() : '';
-    if (!value) { toast('请填写 OAuth Client ID', 'err'); return; }
-    btn.disabled = true;
-    api('/api/settings', { method: 'PUT', body: { community_client_id: value } })
-      .then(function () {
-        toast('已保存，接着点「用若道账号登录」', 'ok');
         return loadCommunity(true);
       })
       .catch(function (e) {
@@ -2344,8 +2267,6 @@
       renderCommunity();
     } else if (type === 'delete-community') {
       deleteCommunity(action);
-    } else if (type === 'save-community-client') {
-      saveCommunityClient(action);
     } else if (type === 'refresh-community') {
       loadCommunity(true).then(function (ok) {
         if (!ok) {
@@ -2361,6 +2282,16 @@
 
   // ---------------------------------------------------------------- bindings
   function bind() {
+    document.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter' || event.isComposing) { return; }
+      var id = event.target && event.target.id;
+      if (id !== 'communityEmail' && id !== 'communityPassword') { return; }
+      var loginBtn = document.querySelector('[data-action="community-login"]');
+      if (loginBtn && !loginBtn.disabled) {
+        event.preventDefault();
+        communityLogin(loginBtn);
+      }
+    });
     document.addEventListener('input', function (event) {
       if (event.target && event.target.id === 'communityDraft') {
         state.communityDraft = event.target.value;

@@ -3,19 +3,16 @@
 评论数据只有一份，写在若道（``content_market_comments``）。本模块做两件事：
 
 1. 匿名读取公开评论（不需要登录，代码里不放任何凭证）；
-2. 用若道账号走 OAuth 2.0 授权码 + PKCE 拿到 ``app:comments`` 令牌后，
-   代理发表 / 回复 / 删除评论。令牌只保存在本机 SQLite，不出现在页面与日志里。
+2. 用若道账号（邮箱 + 密码）换取站内登录令牌后，代理发表 / 回复 / 删除
+   评论。**密码只用一次**，换完令牌立刻丢弃；令牌只保存在本机 SQLite，
+   不出现在页面、日志和错误信息里。
 
 接口与约定见 https://ruodao.com/open-source/docs 。
 """
 
-import base64
-import hashlib
 import datetime
 import html as html_lib
-import json
 import re
-import secrets
 import threading
 import time
 import urllib.parse
@@ -31,11 +28,8 @@ DEFAULT_BASE = "https://ruodao.com"
 CACHE_TTL = 60
 PAGE_SIZE = 30
 MAX_BODY = 1000          # 服务端上限 1000 字
-MAX_REPLY_DEPTH = 2
 POST_INTERVAL = 3.0      # 本机最小发帖间隔，避免误触连点
-AUTH_TTL = 900           # 授权 state 有效期
 AUTH_SETTING = "community_auth"
-SCOPE = "openid profile app:comments"
 
 _BLOCK_TAGS = {
     "p", "div", "br", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -45,74 +39,84 @@ _BLOCK_TAGS = {
 
 class _TextExtractor(HTMLParser):
     def __init__(self):
-        super(_TextExtractor, self).__init__(convert_charrefs=True)
-        self.chunks = []
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.parts = []
         self._skip = 0
 
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style"):
             self._skip += 1
         elif tag in _BLOCK_TAGS:
-            self.chunks.append("\n")
+            self.parts.append("\n")
 
     def handle_startendtag(self, tag, attrs):
         if tag in _BLOCK_TAGS:
-            self.chunks.append("\n")
+            self.parts.append("\n")
 
     def handle_endtag(self, tag):
         if tag in ("script", "style"):
-            if self._skip:
-                self._skip -= 1
+            self._skip = max(0, self._skip - 1)
         elif tag in _BLOCK_TAGS:
-            self.chunks.append("\n")
+            self.parts.append("\n")
 
     def handle_data(self, data):
         if not self._skip:
-            self.chunks.append(data)
+            self.parts.append(data)
+
+    def text(self):
+        return "".join(self.parts)
 
 
 def html_to_text(raw, limit=MAX_BODY):
-    text = str(raw or "")
-    if not text:
+    value = str(raw or "")
+    if not value:
         return ""
-    try:
-        extractor = _TextExtractor()
-        extractor.feed(text)
-        extractor.close()
-        text = "".join(extractor.chunks)
-    except Exception:
-        text = html_lib.unescape(re.sub(r"<[^>]+>", " ", text))
-    text = text.replace("\u00a0", " ")
-    lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip()
-             for line in text.split("\n")]
-    text = "\n".join(line for line in lines if line)
-    if len(text) > limit:
-        text = text[:limit].rstrip() + "…"
-    return text
+    if "<" in value and ">" in value:
+        parser = _TextExtractor()
+        try:
+            parser.feed(value)
+            parser.close()
+            value = parser.text()
+        except Exception:
+            value = re.sub(r"<[^>]+>", " ", value)
+    value = html_lib.unescape(value)
+    value = re.sub(r"[ \t\r\f\v]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    value = value.strip()
+    if limit and len(value) > limit:
+        value = value[:limit].rstrip() + "…"
+    return value
 
 
 def _clean_text(value, limit=200):
-    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "")).strip()
-    return text[:limit]
+    return html_to_text(value, limit=limit) if value else ""
 
 
 def _timestamp(value):
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 1e11:
+            number = number / 1000.0
+        return int(number)
     text = str(value or "").strip()
     if not text:
         return 0
+    if text.isdigit():
+        number = float(text)
+        if number > 1e11:
+            number = number / 1000.0
+        return int(number)
+    cleaned = text.replace("Z", "+00:00")
+    match = re.match(r"^(.*?\.\d{6})\d*([+-]\d{2}:\d{2})$", cleaned)
+    if match:
+        cleaned = match.group(1) + match.group(2)
     try:
-        dt = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(cleaned)
     except Exception:
         return 0
-    if dt.tzinfo is None:
-        # 若道接口返回的是不带时区的北京时间
-        dt = dt.replace(tzinfo=datetime.timezone(
-            datetime.timedelta(hours=8)))
-    return dt.timestamp()
-
-
-def _b64url(raw):
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return int(parsed.timestamp())
 
 
 class CommunityClient(object):
@@ -124,7 +128,6 @@ class CommunityClient(object):
         self._lock = threading.Lock()
         self._cache = None
         self._cache_at = 0.0
-        self._states = {}
         self._last_post = 0.0
 
     # -- 基础配置 --------------------------------------------------------
@@ -139,18 +142,6 @@ class CommunityClient(object):
             or ITEM_SLUG
 
     @property
-    def client_id(self):
-        return str(self.config.get("community_client_id") or "").strip()
-
-    @property
-    def redirect_uri(self):
-        custom = str(self.config.get("community_redirect_uri") or "").strip()
-        if custom:
-            return custom
-        return "http://%s:%d/api/community/auth/callback" % (
-            "127.0.0.1", self.config.port)
-
-    @property
     def timeout(self):
         try:
             return max(5, int(self.config.get("community_timeout") or 15))
@@ -163,7 +154,7 @@ class CommunityClient(object):
     def docs_url(self):
         return "%s/open-source/docs" % self.base
 
-    # -- 令牌 ------------------------------------------------------------
+    # -- 登录态 ----------------------------------------------------------
     def _auth(self):
         data = self.store.get_setting(AUTH_SETTING, {}) or {}
         return data if isinstance(data, dict) else {}
@@ -174,174 +165,107 @@ class CommunityClient(object):
     def auth_status(self):
         auth = self._auth()
         user = auth.get("user") if isinstance(auth.get("user"), dict) else {}
-        expires_at = auth.get("expires_at") or 0
         return {
-            "configured": bool(self.client_id),
-            "logged_in": bool(auth.get("access_token")),
+            "method": "password",
+            "configured": True,
+            "logged_in": bool(auth.get("token")),
             "user": {
-                "id": str(user.get("userId") or ""),
-                "name": str(user.get("displayName") or ""),
-                "avatar": str(user.get("avatarUrl") or ""),
-                "email": str(user.get("maskedEmail") or ""),
+                "id": str(user.get("id") or ""),
+                "name": str(user.get("name") or ""),
+                "avatar": str(user.get("avatar") or ""),
+                "email": str(user.get("email") or auth.get("email") or ""),
             } if user else None,
-            "expires_at": expires_at,
-            "redirect_uri": self.redirect_uri,
-            "scope": str(auth.get("scope") or ""),
+            "login_url": "%s/login" % self.base,
         }
 
-    def _access_token(self):
-        auth = self._auth()
-        token = str(auth.get("access_token") or "")
+    def _token(self):
+        token = str(self._auth().get("token") or "")
         if not token:
             raise UpstreamError("请先用若道账号登录后再发言", status=401)
-        expires_at = float(auth.get("expires_at") or 0)
-        if expires_at and expires_at - 60 > time.time():
-            return token
-        refresh_token = str(auth.get("refresh_token") or "")
-        if not refresh_token:
-            self._save_auth({})
-            raise UpstreamError("若道登录已过期，请重新登录", status=401)
-        try:
-            fresh = self._refresh(refresh_token)
-        except UpstreamError:
-            self._save_auth({})
-            raise
-        return str(fresh.get("access_token") or "")
+        return token
 
-    def _refresh(self, refresh_token):
-        body = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": self.client_id,
-        }).encode("utf-8")
+    def login(self, email, password):
+        """用若道账号密码换站内令牌；密码不落地，只留令牌和昵称。"""
+        email = str(email or "").strip()
+        password = str(password or "")
+        if not email or not password:
+            raise UpstreamError("请填写若道账号的邮箱和密码", status=400)
+        if "@" not in email:
+            raise UpstreamError("若道账号用的是邮箱，请填写完整邮箱地址",
+                                status=400)
         status, obj, _ = util.http_json(
-            self.base + "/api/oauth/token", method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded",
-                     "Accept": "application/json"},
-            body=body, timeout=self.timeout)
-        if status != 200 or not isinstance(obj, dict) or not obj.get("access_token"):
-            self.log("WARN", "若道令牌续期失败：HTTP %s" % status)
-            raise UpstreamError("若道登录已过期，请重新登录", status=401)
-        self._store_token(obj, keep_user=True)
-        return obj
-
-    def _store_token(self, payload, keep_user=True):
-        auth = self._auth() if keep_user else {}
-        try:
-            expires_in = int(payload.get("expires_in") or 7200)
-        except Exception:
-            expires_in = 7200
-        auth.update({
-            "access_token": str(payload.get("access_token") or ""),
-            "refresh_token": str(payload.get("refresh_token")
-                                 or auth.get("refresh_token") or ""),
-            "scope": str(payload.get("scope") or auth.get("scope") or SCOPE),
-            "expires_at": time.time() + expires_in,
-            "obtained_at": int(time.time()),
-        })
-        self._save_auth(auth)
-
-    # -- OAuth（授权码 + PKCE，公开客户端） ------------------------------
-    def start_auth(self):
-        if not self.client_id:
-            raise UpstreamError(
-                "还没有配置若道 OAuth 客户端 ID：请到 ruodao.com/open-platform "
-                "创建「公开客户端」，回调地址填 %s，再把 client_id 填到设置页"
-                % self.redirect_uri, status=400)
-        verifier = _b64url(secrets.token_bytes(48))
-        challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-        state = secrets.token_urlsafe(18)
-        with self._lock:
-            now = time.time()
-            self._states = {k: v for k, v in self._states.items()
-                            if now - v.get("at", 0) < AUTH_TTL}
-            self._states[state] = {"verifier": verifier, "at": now,
-                                   "redirect_uri": self.redirect_uri}
-        query = urllib.parse.urlencode({
-            "response_type": "code",
-            "client_id": self.client_id,
-            "redirect_uri": self.redirect_uri,
-            "scope": SCOPE,
-            "state": state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        })
-        return {"authorize_url": "%s/oauth/authorize?%s" % (self.base, query),
-                "state": state, "redirect_uri": self.redirect_uri}
-
-    def complete_auth(self, query):
-        params = urllib.parse.parse_qs(query or "")
-        state = (params.get("state") or [""])[0]
-        code = (params.get("code") or [""])[0]
-        error = (params.get("error") or [""])[0]
-        if error:
-            return False, "授权被取消或失败：%s" % _clean_text(
-                (params.get("error_description") or [error])[0], 200)
-        if not state or not code:
-            return False, "回调参数不完整，请回到面板重新登录"
-        with self._lock:
-            pending = self._states.pop(state, None)
-        if not pending:
-            return False, "授权状态已失效，请回到面板重新点击登录"
-        if time.time() - pending.get("at", 0) > AUTH_TTL:
-            return False, "授权超时，请重新登录"
-        body = urllib.parse.urlencode({
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": pending.get("redirect_uri") or self.redirect_uri,
-            "code_verifier": pending.get("verifier") or "",
-            "client_id": self.client_id,
-        }).encode("utf-8")
-        status, obj, _ = util.http_json(
-            self.base + "/api/oauth/token", method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded",
-                     "Accept": "application/json"},
-            body=body, timeout=self.timeout)
-        if status != 200 or not isinstance(obj, dict) or not obj.get("access_token"):
+            self.base + "/api/auth/login", method="POST",
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "User-Agent": util.DEFAULT_UA},
+            body={"email": email, "password": password},
+            timeout=self.timeout)
+        data = obj.get("data") if isinstance(obj, dict) else None
+        token = ""
+        if isinstance(data, dict):
+            token = str(data.get("token") or data.get("accessToken") or "")
+        if not token and isinstance(obj, dict):
+            token = str(obj.get("token") or "")
+        if status != 200 or not token:
             message = ""
             if isinstance(obj, dict):
-                message = str(obj.get("error_description")
-                              or obj.get("message") or obj.get("error") or "")
-            self.log("WARN", "若道授权换取令牌失败：HTTP %s %s" % (status, message))
-            return False, "换取令牌失败：%s" % (message or ("HTTP %s" % status))
-        self._store_token(obj, keep_user=False)
+                message = str(obj.get("message") or obj.get("errorCode") or "")
+            if "invalid email or password" in message.lower():
+                message = "邮箱或密码不对"
+            elif status == 429:
+                message = "尝试太频繁了，过一会儿再试"
+            elif status >= 500:
+                message = "若道服务暂时不可用（HTTP %s）" % status
+            raise UpstreamError("登录失败：%s" % (message or ("HTTP %s" % status)),
+                                status=401)
+        self._save_auth({"token": token, "email": email,
+                         "obtained_at": int(time.time())})
         user = self._fetch_user()
         if user:
             auth = self._auth()
             auth["user"] = user
             self._save_auth(auth)
         self.log("INFO", "若道社区已登录：%s" % (
-            (user or {}).get("displayName") or "若道用户"))
-        return True, "已登录若道账号，可以在这里发言了"
+            (user or {}).get("name") or email))
+        return {"ok": True, "user": user, "auth": self.auth_status()}
 
     def _fetch_user(self):
-        auth = self._auth()
-        token = str(auth.get("access_token") or "")
+        token = str(self._auth().get("token") or "")
         if not token:
             return None
         status, obj, _ = util.http_json(
-            self.base + "/api/public/apps/me",
+            self.base + "/api/users/me",
             headers={"Authorization": "Bearer " + token,
-                     "Accept": "application/json"},
+                     "Accept": "application/json",
+                     "User-Agent": util.DEFAULT_UA},
             timeout=self.timeout)
         if status != 200 or not isinstance(obj, dict):
             return None
         data = obj.get("data")
+        if isinstance(data, dict) and isinstance(data.get("user"), dict):
+            data = data["user"]
         if not isinstance(data, dict):
             return None
+        name = (data.get("displayName") or data.get("nickname")
+                or data.get("name") or data.get("username") or "")
+        email = data.get("email") or data.get("maskedEmail") or ""
         return {
-            "userId": str(data.get("userId") or ""),
-            "displayName": str(data.get("displayName") or ""),
-            "avatarUrl": str(data.get("avatarUrl") or ""),
-            "maskedEmail": str(data.get("maskedEmail") or ""),
+            "id": str(data.get("id") or data.get("userId") or ""),
+            "name": str(name or ""),
+            "avatar": str(data.get("avatarUrl") or data.get("avatar") or ""),
+            "email": str(email or ""),
         }
 
     def logout(self):
         self._save_auth({})
-        with self._lock:
-            self._states.clear()
+        self._forget_cache()
         self.log("INFO", "已退出若道社区账号")
         return True
+
+    def _forget_cache(self):
+        with self._lock:
+            self._cache = None
+            self._cache_at = 0.0
 
     # -- 读取 ------------------------------------------------------------
     def snapshot(self, refresh=False):
@@ -377,16 +301,19 @@ class CommunityClient(object):
         payload["auth"] = self.auth_status()
         return payload
 
+    def _comments_url(self):
+        return "%s/api/content-market/items/%s/comments" % (
+            self.base, urllib.parse.quote(self.slug))
+
     def _fetch(self):
-        url = "%s/api/public/apps/%s/comments?page=1&size=%d" % (
-            self.base, urllib.parse.quote(self.slug), PAGE_SIZE)
+        url = "%s?page=1&size=%d" % (self._comments_url(), PAGE_SIZE)
         headers = {"User-Agent": util.DEFAULT_UA, "Accept": "application/json"}
-        token = str(self._auth().get("access_token") or "")
+        token = str(self._auth().get("token") or "")
         if token:
             headers["Authorization"] = "Bearer " + token
         status, obj, _ = util.http_json(url, headers=headers,
                                         timeout=self.timeout)
-        if status == 401 and token:
+        if status in (401, 403) and token:
             # 令牌失效时丢掉它，匿名再读一次：读公开评论本来就不需要登录
             self._save_auth({})
             headers.pop("Authorization", None)
@@ -461,26 +388,21 @@ class CommunityClient(object):
         with self._lock:
             if now - self._last_post < POST_INTERVAL:
                 raise UpstreamError("发言太快了，稍等一下再发", status=429)
-        token = self._access_token()
+        token = self._token()
         payload = {"body": text}
         parent_id = str(parent_id or "").strip()
         if parent_id:
             payload["parentCommentId"] = parent_id
-        url = "%s/api/public/apps/%s/comments" % (
-            self.base, urllib.parse.quote(self.slug))
         status, obj, _ = util.http_json(
-            url, method="POST",
+            self._comments_url(), method="POST",
             headers={"Authorization": "Bearer " + token,
                      "Accept": "application/json",
                      "Content-Type": "application/json",
                      "User-Agent": util.DEFAULT_UA},
             body=payload, timeout=self.timeout)
-        if status == 401:
+        if status in (401, 403):
             self._save_auth({})
             raise UpstreamError("若道登录已失效，请重新登录", status=401)
-        if status == 403:
-            raise UpstreamError("若道账号缺少 app:comments 授权，请重新登录并同意",
-                                status=403)
         if status != 200:
             message = ""
             if isinstance(obj, dict):
@@ -491,14 +413,15 @@ class CommunityClient(object):
             self._last_post = now
             self._cache = None
         self.log("INFO", "在若道社区发表了%s" % ("回复" if parent_id else "评论"))
-        return {"ok": True, "result": obj.get("data") if isinstance(obj, dict) else None}
+        return {"ok": True,
+                "result": obj.get("data") if isinstance(obj, dict) else None}
 
     def delete(self, comment_id):
         comment_id = str(comment_id or "").strip()
         if not comment_id:
             raise UpstreamError("评论 ID 为空", status=400)
-        token = self._access_token()
-        url = "%s/api/public/apps/comments/%s" % (
+        token = self._token()
+        url = "%s/api/content-market/comments/%s" % (
             self.base, urllib.parse.quote(comment_id))
         status, obj, _ = util.http_json(
             url, method="DELETE",
@@ -506,7 +429,7 @@ class CommunityClient(object):
                      "Accept": "application/json",
                      "User-Agent": util.DEFAULT_UA},
             timeout=self.timeout)
-        if status == 401:
+        if status in (401, 403):
             self._save_auth({})
             raise UpstreamError("若道登录已失效，请重新登录", status=401)
         if status not in (200, 204):
@@ -515,29 +438,6 @@ class CommunityClient(object):
                 message = str(obj.get("message") or "")
             raise UpstreamError(message or ("删除失败（HTTP %s）" % status),
                                 status=400 if status < 500 else 502)
-        with self._lock:
-            self._cache = None
+        self._forget_cache()
         self.log("INFO", "删除了自己在若道社区的一条评论")
         return {"ok": True}
-
-
-def render_callback_page(ok, message):
-    """OAuth 回调返回的小页面：提示结果并尝试自动关闭窗口。"""
-    title = "授权成功" if ok else "授权未完成"
-    color = "#17945c" if ok else "#c4552d"
-    script = ("<script>setTimeout(function(){window.close();},1200)</script>"
-              if ok else "")
-    return (
-        "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-        "<title>%s · 若道 2API</title><style>"
-        "body{margin:0;height:100vh;display:flex;align-items:center;"
-        "justify-content:center;background:#f7f8fa;color:#1f2430;"
-        "font:14px/1.7 -apple-system,'Segoe UI',sans-serif}"
-        ".box{background:#fff;border:1px solid #e6e8ef;border-radius:14px;"
-        "padding:28px 34px;max-width:420px;box-shadow:0 8px 30px rgba(20,25,40,.06)}"
-        "h1{font-size:16px;margin:0 0 10px;color:%s}p{margin:0;color:#5a6273}"
-        "small{display:block;margin-top:14px;color:#98a0b0}</style></head><body>"
-        "<div class=\"box\"><h1>%s</h1><p>%s</p>"
-        "<small>可以关闭此页面，回到 Ruodao2API 面板继续。</small></div>%s"
-        "</body></html>" % (title, color, title, html_lib.escape(message), script)
-    )

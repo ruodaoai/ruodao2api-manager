@@ -857,6 +857,17 @@ td.num { font-variant-numeric: tabular-nums; }
   line-height: 16px;
 }
 
+.community-login-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 12px;
+  margin-top: 14px;
+}
+.community-login-grid .field { margin: 0; }
+@media (max-width: 720px) {
+  .community-login-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* ---------- responsive ---------- */
 @media (max-width: 1020px) {
   .channel-grid { grid-template-columns: 1fr 1fr; }
