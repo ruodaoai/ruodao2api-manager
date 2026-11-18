@@ -121,6 +121,7 @@ class Scheduler(object):
                 continue
             try:
                 channel.checkin(account)
+                self.runtime.accounts.refresh_balance(account, force=True)
                 self.runtime.accounts.save(account)
                 checked += 1
                 self.runtime.log("INFO", "自动签到 %s/%s：%s"

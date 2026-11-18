@@ -51,22 +51,22 @@ ALREADY_MARKERS = ("已签到", "已经签到", "already checked in",
 
 FALLBACK_MODELS = {
     "cn": [
-        ("deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 128000),
-        ("deepseek-v4-flash", "DeepSeek V4 Flash", 128000),
-        ("deepseek-v4-pro", "DeepSeek V4 Pro", 128000),
-        ("glm-5.3", "GLM-5.3", 200000),
-        ("glm-5.3-flash", "GLM-5.3 Flash", 200000),
-        ("glm-5.2", "GLM-5.2", 200000),
-        ("glm-5.1", "GLM-5.1", 200000),
-        ("glm-5v-turbo", "GLM-5V Turbo", 128000),
-        ("hy3", "混元 3", 128000),
-        ("hy3-x", "混元 3 X", 128000),
-        ("hy4-preview", "混元 4 Preview", 128000),
-        ("hy4-preview-x", "混元 4 Preview X", 128000),
-        ("kimi-k3-1", "Kimi K3.1", 200000),
-        ("kimi-k2.7", "Kimi K2.7", 200000),
-        ("kimi-k2.6", "Kimi K2.6", 200000),
-        ("minimax-m3", "MiniMax M3", 200000),
+        ("auto", "Auto", 256000),
+        ("hy4std", "Hy4", 960000),
+        ("hy4flash-free", "Hy4 flash", 960000),
+        ("hy4flash", "Hy4 flash", 960000),
+        ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", 1000000),
+        ("glm-5.3", "GLM-5.3", 1000000),
+        ("glm-5.3-flash", "GLM-5.3-Flash", 1000000),
+        ("glm-5.2", "GLM-5.2", 1000000),
+        ("kimi-k3.1-pro", "Kimi-K3.1-Pro", 1000000),
+        ("kimi-k3-1", "Kimi-K3", 1000000),
+        ("kimi-k2.8-preview", "Kimi-K2.8-Preview", 1000000),
+        ("space-bunny", "Space-Bunny", 1000000),
+        ("minimax-m3.1-flash", "MiniMax-M3.1-Flash", 1000000),
+        ("deepseek-v4-pro", "DeepSeek-V4-Pro", 1000000),
+        ("step-5-preview", "Step-5-Preview", 1000000),
+        ("mimo-v2.6-pro", "Xiaomi MiMo-V2.6-Pro", 1000000),
     ],
     "global": [
         ("fast-model", "Fast Model", 128000),
@@ -377,7 +377,32 @@ class CodeBuddyChannel(BaseChannel):
         self._login_lock = threading.Lock()
 
     # -- models -----------------------------------------------------------
+    def _raw_from_row(self, row):
+        caps = row.get("capabilities") or {}
+        mid = str(row.get("raw_id") or row.get("id") or "")
+        return {
+            "id": mid,
+            "name": row.get("display_name") or mid,
+            "context_length": util.safe_int(row.get("context_length"), 128000),
+            "max_output_tokens": util.safe_int(row.get("max_output_tokens"), 0),
+            "efforts": list(row.get("efforts") or []),
+            "tags": [],
+            "vendor": "",
+            "credits": str(row.get("credits") or ""),
+            "supports_images": caps.get("vision"),
+            "supports_tool_call": bool(caps.get("tools", True)),
+            "description": str(row.get("description") or ""),
+        }
+
     def _catalog(self, realm):
+        catalog = getattr(self.app, "models_catalog", None)
+        if catalog:
+            try:
+                rows = catalog.rows(self.name, realm)
+            except Exception:
+                rows = []
+            if rows:
+                return [self._raw_from_row(row) for row in rows]
         with _MODEL_LOCK:
             slot = _MODEL_CACHE.get(realm) or {}
             models = list(slot.get("models") or [])
@@ -397,20 +422,63 @@ class CodeBuddyChannel(BaseChannel):
             "description": "",
         } for mid, name, context in FALLBACK_MODELS.get(realm, [])]
 
+    def _rows_for_realm(self, realm, models):
+        rows = []
+        for model in models or []:
+            mid = str(model.get("id") or "")
+            if not mid:
+                continue
+            credits = str(model.get("credits") or "")
+            rows.append({
+                "id": "codebuddy/%s/%s" % (realm, mid),
+                "raw_id": mid,
+                "object": "model",
+                "channel": self.name,
+                "channel_label": self.label,
+                "realm": realm,
+                "realm_label": REALMS[realm]["name"],
+                "owned_by": "WorkBuddy %s" % REALMS[realm]["name"],
+                "display_name": model.get("name") or mid,
+                "created": 0,
+                "context_length": model.get("context_length") or 128000,
+                "max_output_tokens": model.get("max_output_tokens") or 0,
+                "capabilities": {
+                    "vision": model.get("supports_images") is True,
+                    "reasoning": bool(model.get("efforts")),
+                    "tools": bool(model.get("supports_tool_call", True)),
+                    "free": credits.lower() in ("x0.00", "0", "0.00", "免费"),
+                },
+                "efforts": model.get("efforts") or [],
+                "credits": credits,
+                "description": model.get("description") or "",
+            })
+        return rows
+
     def refresh_catalog(self, account=None):
         accounts = [account] if account else [
             a for a in self.app.accounts.list("codebuddy") if a.get("enabled")]
+        found = {}
+        errors = []
         for acc in accounts:
             realm = _realm_of(acc.get("data") or {})
             try:
                 models = self._fetch_models(acc)
             except Exception as exc:
-                self.app.log("WARN", "WorkBuddy 模型目录刷新失败: %s" % exc)
+                errors.append("%s：%s" % (REALMS[realm]["name"], exc))
                 continue
-            if models:
-                with _MODEL_LOCK:
-                    _MODEL_CACHE[realm] = {"at": time.time(), "models": models}
-        return self.list_models()
+            if not models:
+                errors.append("%s：上游返回空模型列表" % REALMS[realm]["name"])
+                continue
+            with _MODEL_LOCK:
+                _MODEL_CACHE[realm] = {"at": time.time(), "models": models}
+            realm_models = found.setdefault(realm, {})
+            for model in models:
+                realm_models.setdefault(model["id"], model)
+        rows = []
+        for realm, by_id in found.items():
+            rows.extend(self._rows_for_realm(realm, list(by_id.values())))
+        return {"ok": bool(rows), "models": rows, "source": "实时",
+                "message": "；".join(errors)}
 
     def list_models(self, account=None):
         if account:
@@ -427,31 +495,7 @@ class CodeBuddyChannel(BaseChannel):
                     pass
         out = []
         for realm in ("cn", "global"):
-            for model in self._catalog(realm):
-                mid = str(model.get("id") or "")
-                if not mid:
-                    continue
-                out.append({
-                    "id": "codebuddy/%s/%s" % (realm, mid),
-                    "raw_id": mid,
-                    "object": "model",
-                    "channel": "codebuddy",
-                    "channel_label": "WorkBuddy",
-                    "realm": realm,
-                    "realm_label": REALMS[realm]["name"],
-                    "owned_by": "WorkBuddy %s" % REALMS[realm]["name"],
-                    "display_name": model.get("name") or mid,
-                    "created": 0,
-                    "context_length": model.get("context_length") or 128000,
-                    "capabilities": {
-                        "vision": model.get("supports_images") is True,
-                        "reasoning": bool(model.get("efforts")),
-                        "tools": bool(model.get("supports_tool_call", True)),
-                        "free": False,
-                    },
-                    "efforts": model.get("efforts") or [],
-                    "description": model.get("description") or "",
-                })
+            out.extend(self._rows_for_realm(realm, self._catalog(realm)))
         return out
 
     def _fetch_models(self, account):

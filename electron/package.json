@@ -67,7 +67,8 @@
       "packElevateHelper": false
     },
     "portable": {
-      "artifactName": "Ruodao2API.exe"
+      "artifactName": "Ruodao2API.exe",
+      "unpackDirName": "Ruodao2API"
     }
   },
   "author": "Ruodao2API"

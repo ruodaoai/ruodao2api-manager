@@ -24,6 +24,11 @@ class BaseChannel(object):
         """Return a list of model dicts in gateway shape."""
         return []
 
+    def refresh_catalog(self, account=None):
+        """Fetch a live model catalog (gateway shape). Return dict with ok/models."""
+        return {"ok": False, "models": [], "persist": False,
+                "message": "该渠道不支持更新模型目录"}
+
     def resolve_model(self, requested):
         """Map a client-facing model name (without channel prefix) to upstream id."""
         for m in self.list_models():

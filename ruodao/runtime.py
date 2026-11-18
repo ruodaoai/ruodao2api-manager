@@ -10,14 +10,18 @@ from .channels.codebuddy import CodeBuddyChannel
 from .channels.openai_compat import OpenAICompatChannel
 from .channels.qoder import QoderChannel
 from .channels.zcode import ZCodeChannel
+from .community import CommunityClient
 from .config import DB_PATH, Config
 from .guard import Guard
+from .models import ModelCatalog
 from .store import Store
 
 
 CHANNEL_META = {
     "qoder": {"label": "Qoder", "color": "#6d5ce7",
               "realm_options": [["cn", "国内版"], ["intl", "国际版"]],
+              "realm_hint": "国内版登录 qoder.com.cn，国际版登录 qoder.com；"
+                            "两个版本均支持 OAuth、PAT 与本地客户端导入，签到互不影响。",
               "login": "oauth", "local_import": True},
     "codebuddy": {"label": "WorkBuddy", "color": "#2f7de1",
                   "realm_options": [["cn", "国内版"], ["global", "国际版"]],
@@ -37,6 +41,7 @@ class Runtime(object):
         self.started_at = time.time()
         self._log_sink = []
         self.api_keys = ApiKeyManager(self.store, self.config, self.log)
+        self.models_catalog = ModelCatalog()
         self.channels = {
             "qoder": QoderChannel(self),
             "codebuddy": CodeBuddyChannel(self),
@@ -44,6 +49,7 @@ class Runtime(object):
             "gpt": OpenAICompatChannel(self),
         }
         self.accounts = AccountManager(self.store, self.channels, self.log)
+        self.community = CommunityClient(self)
         self.guard = Guard(self)
         self.scheduler = None
 
@@ -80,6 +86,7 @@ class Runtime(object):
                 "label": meta["label"],
                 "color": meta["color"],
                 "realm_options": meta["realm_options"],
+                "realm_hint": meta.get("realm_hint") or "",
                 "login": meta["login"],
                 "local_import": meta["local_import"],
                 "supports_checkin": bool(channel and channel.supports_checkin),
@@ -96,6 +103,47 @@ class Runtime(object):
             except Exception as exc:
                 self.log("WARN", "读取 %s 模型失败: %s" % (channel.label, exc))
         return out
+
+    def models_meta(self):
+        return self.models_catalog.meta()
+
+    def refresh_models(self):
+        results = {}
+        total = 0
+        ok_any = False
+        persisted = False
+        for name, channel in self.channels.items():
+            try:
+                outcome = channel.refresh_catalog() or {}
+            except Exception as exc:
+                self.log("WARN", "%s 模型目录更新失败：%s" % (channel.label, exc))
+                results[name] = {"ok": False, "count": 0, "source": "",
+                                 "message": str(exc)}
+                continue
+            models = outcome.get("models") or []
+            source = str(outcome.get("source") or "")
+            if models and outcome.get("persist", True):
+                self.models_catalog.replace(name, models, source or "live")
+                persisted = True
+            if models or outcome.get("ok"):
+                ok_any = True
+            total += len(models)
+            results[name] = {
+                "ok": bool(outcome.get("ok", bool(models))),
+                "count": len(models),
+                "source": source,
+                "message": str(outcome.get("message") or ""),
+            }
+            if outcome.get("message") and not models:
+                self.log("WARN", "%s 模型目录更新：%s"
+                         % (channel.label, outcome["message"]))
+        if ok_any and not persisted:
+            self.models_catalog.touch()
+        updated_at = self.models_catalog.updated_at() if ok_any else 0
+        if total:
+            self.log("INFO", "模型目录已更新：共 %d 个模型" % total)
+        return {"ok": ok_any, "updated": total, "channels": results,
+                "updated_at": updated_at}
 
     def find_model(self, requested, channel=None):
         found = self._find_models(requested, channel)

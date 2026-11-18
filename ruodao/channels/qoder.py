@@ -265,10 +265,10 @@ def _normalize_tools(tools):
     return out
 
 
-def _find_catalog(realm, raw):
+def _find_in(models, raw):
     raw = str(raw or "").strip()
     low = raw.lower()
-    for m in _load_catalog(realm):
+    for m in models or []:
         if str(m.get("key") or "").lower() == low:
             return m
         if str(m.get("display_name") or "").lower() == low:
@@ -428,10 +428,170 @@ class QoderChannel(BaseChannel):
         self._cache_lock = threading.Lock()
 
     # -- models -----------------------------------------------------------
+    def _snapshot_rows(self, realm):
+        catalog = getattr(self.app, "models_catalog", None)
+        if not catalog:
+            return []
+        try:
+            return catalog.rows(self.name, realm)
+        except Exception:
+            return []
+
+    def _catalog_models(self, realm):
+        base = list(_load_catalog(realm))
+        rows = self._snapshot_rows(realm)
+        if not rows:
+            return base
+        by_key = {str(m.get("key") or ""): m for m in base if m.get("key")}
+        order = [str(m.get("key") or "") for m in base if m.get("key")]
+        for row in rows:
+            key = str(row.get("raw_id") or "").strip()
+            if not key:
+                continue
+            caps = row.get("capabilities") or {}
+            meta = {
+                "key": key,
+                "display_name": row.get("display_name") or key,
+                "is_vl": bool(caps.get("vision")),
+                "is_reasoning": bool(caps.get("reasoning")),
+                "is_free": bool(caps.get("free")),
+                "price_factor": row.get("price_factor"),
+                "max_input_tokens": row.get("context_length") or 180000,
+                "enable": True,
+            }
+            if key not in by_key:
+                order.append(key)
+            by_key[key] = meta
+        return [by_key[key] for key in order if key in by_key]
+
+    def _rows_from_models(self, realm, models):
+        cfg = REALMS[realm]
+        rows = []
+        for m in models or []:
+            key = str(m.get("key") or "").strip()
+            if not key:
+                continue
+            rows.append({
+                "id": "qoder/%s/%s" % (realm, key),
+                "raw_id": key,
+                "object": "model",
+                "channel": self.name,
+                "channel_label": self.label,
+                "realm": realm,
+                "realm_label": cfg["name"],
+                "owned_by": "Qoder %s" % cfg["name"],
+                "display_name": str(m.get("display_name") or key),
+                "created": 0,
+                "context_length": util.safe_int(m.get("max_input_tokens"), 180000),
+                "capabilities": {
+                    "vision": bool(m.get("is_vl")),
+                    "reasoning": bool(m.get("is_reasoning")),
+                    "free": bool(m.get("is_free")),
+                    "tools": True,
+                },
+                "price_factor": m.get("price_factor"),
+            })
+        return rows
+
+    def _fetch_live_models(self, realm, account):
+        token = str((account.get("data") or {}).get("access_token") or "")
+        if not token:
+            raise UpstreamError("账号没有 access token")
+        sess = self._session_for(account)
+        url = REALMS[realm]["gateway"] + MODELS_PATH
+        headers = sess.headers("", url, sse=False, accept="application/json")
+        status, obj, raw = util.http_json(url, headers=headers, timeout=30)
+        if status >= 400:
+            raise UpstreamError("HTTP %s %s" % (status, str(raw)[:160]))
+        chat = None
+        if isinstance(obj, dict):
+            chat = obj.get("chat")
+            if not isinstance(chat, list):
+                data = obj.get("data")
+                if isinstance(data, dict):
+                    chat = data.get("chat") or data.get("models")
+                elif isinstance(data, list):
+                    chat = data
+        if not isinstance(chat, list):
+            raise UpstreamError("响应中没有模型列表")
+        return [m for m in chat if isinstance(m, dict) and m.get("key")]
+
+    def _local_models(self, realm, uid=""):
+        cfg = _realm(realm)
+        base = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".models")
+        try:
+            names = os.listdir(base)
+        except Exception:
+            return []
+        candidates = []
+        for name in names:
+            folder = os.path.join(base, name)
+            if not os.path.isdir(folder):
+                continue
+            for filename in ("catalog-v7", "catalog-v6"):
+                path = os.path.join(folder, filename)
+                if os.path.isfile(path):
+                    try:
+                        candidates.append((name == uid, os.path.getmtime(path),
+                                           path, name))
+                    except Exception:
+                        pass
+        candidates.sort(reverse=True)
+        for _, _, path, folder_uid in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    blob = fh.read()
+                plain = sign.qmc_decrypt(blob, folder_uid)
+                obj = json.loads(plain.decode("utf-8"))
+            except Exception:
+                continue
+            chat = obj.get("chat") if isinstance(obj, dict) else None
+            if isinstance(chat, list) and chat:
+                return [m for m in chat
+                        if isinstance(m, dict) and m.get("key")]
+        return []
+
+    def _refresh_realm(self, realm, account):
+        error = ""
+        if account:
+            try:
+                models = self._fetch_live_models(realm, account)
+            except Exception as exc:
+                error = str(exc)
+                models = []
+            if models:
+                return self._rows_from_models(realm, models), "实时", ""
+        uid = str(((account or {}).get("data") or {}).get("uid") or "")
+        models = self._local_models(realm, uid)
+        if models:
+            return self._rows_from_models(realm, models), "本机缓存", ""
+        return [], "", error or "没有可用账号，且本机未找到模型缓存"
+
+    def refresh_catalog(self, account=None):
+        accounts = [account] if account else [
+            a for a in self.app.accounts.list("qoder") if a.get("enabled")]
+        rows = []
+        sources = set()
+        errors = []
+        for realm in ("cn", "intl"):
+            realm_accounts = [a for a in accounts
+                              if (a.get("realm") or "cn") == realm]
+            realm_rows, source, error = self._refresh_realm(
+                realm, realm_accounts[0] if realm_accounts else None)
+            if realm_rows:
+                rows.extend(realm_rows)
+                if source:
+                    sources.add(source)
+            elif error:
+                errors.append("%s：%s" % (REALMS[realm]["name"], error))
+        return {"ok": bool(rows), "models": rows,
+                "source": " / ".join(sorted(sources)),
+                "message": "；".join(errors)}
+
     def list_models(self, account=None):
         out = []
         for realm in ("cn", "intl"):
-            for m in _load_catalog(realm):
+            for m in self._catalog_models(realm):
                 key = str(m.get("key") or "")
                 if not key:
                     continue
@@ -480,7 +640,7 @@ class QoderChannel(BaseChannel):
         realm_order = [realm] if realm else ["cn", "intl"]
         matches = []
         for r in realm_order:
-            m = _find_catalog(r, raw)
+            m = _find_in(self._catalog_models(r), raw)
             if m:
                 matches.append((r, m))
         if not matches:
@@ -553,7 +713,8 @@ class QoderChannel(BaseChannel):
     def stream_chat(self, account, body, upstream_model):
         realm = account.get("realm") or "cn"
         found = self.find_model(upstream_model)
-        meta = (found or {}).get("meta") or _find_catalog(realm, upstream_model) or {}
+        meta = ((found or {}).get("meta")
+                or _find_in(self._catalog_models(realm), upstream_model) or {})
         qbody = _build_qoder_body(body, account, upstream_model, meta, realm)
         encoded = sign.qoder_encode(util.json_dumps(qbody).encode("utf-8"))
         sess = self._session_for(account)
@@ -1296,6 +1457,23 @@ class QoderChannel(BaseChannel):
                     found.append(cli)
         return found
 
+    def public_scan(self):
+        out = []
+        for item in self.scan_local():
+            out.append({
+                "app": "Qoder 桌面端" if item["kind"] == "app" else "Qoder CLI",
+                "path": item["path"],
+                "file": item["file"],
+                "realm": item["realm"],
+                "realm_label": item["realm_label"],
+                "uid": item["uid"],
+                "nickname": item["nickname"],
+                "expires_at": item["expires_at"],
+                "importable": bool(item["valid"]),
+                "error": item.get("error") or "",
+            })
+        return out
+
     def import_local(self, path=None, realm=None):
         scanned = self.scan_local()
         targets = [x for x in scanned if x.get("valid")]
@@ -1305,12 +1483,17 @@ class QoderChannel(BaseChannel):
             if not match:
                 raise UpstreamError("未在扫描结果中找到该凭证文件", status=400)
             targets = match
+        elif realm in REALMS:
+            targets = [x for x in targets if x.get("realm") == realm]
         if not targets:
+            if realm in REALMS:
+                raise UpstreamError("未找到%s的本机登录凭证，请先登录对应客户端"
+                                    % _realm(realm)["name"], status=400)
             raise UpstreamError("没有可导入的本机凭证", status=400)
         imported = []
         errors = []
         for item in targets:
-            target_realm = realm if realm in REALMS else item["realm"]
+            target_realm = item["realm"]
             try:
                 if item["file"] == "auth.v1.dat":
                     data = self._load_app_auth(target_realm)

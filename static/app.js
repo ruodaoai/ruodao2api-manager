@@ -5,11 +5,20 @@
     status: null,
     accounts: [],
     models: [],
+    modelsMeta: null,
     keys: [],
     settings: null,
     usage: null,
     guard: null,
     events: [],
+    community: null,
+    communityLoading: false,
+    communityError: '',
+    communityDraft: '',
+    communityReply: null,
+    communityPosting: false,
+    communityAuthBusy: false,
+    communityPoll: null,
     tab: 'overview',
     accountFilter: 'all',
     modelFilter: 'all',
@@ -64,6 +73,11 @@
     return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
   }
 
+  function todayStr() {
+    var d = new Date();
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+
   function dateInputValue(ts) {
     var text = fmtDate(ts);
     return text === '—' ? '' : text;
@@ -111,6 +125,14 @@
     if (name === 'zcode') { return 'Z'; }
     if (name === 'gpt') { return 'G'; }
     return String(name || '?').slice(0, 1).toUpperCase();
+  }
+
+  function realmLabelOf(channel, realm) {
+    var options = channelMeta(channel).realm_options || [];
+    for (var i = 0; i < options.length; i += 1) {
+      if (options[i][0] === realm) { return options[i][1]; }
+    }
+    return realm || '';
   }
 
   function toast(message, kind) {
@@ -188,7 +210,10 @@
   }
 
   function loadModels() {
-    return api('/api/models').then(function (data) { state.models = data.data || []; });
+    return api('/api/models').then(function (data) {
+      state.models = data.data || [];
+      state.modelsMeta = data.meta || null;
+    });
   }
 
   function loadKeys() {
@@ -226,6 +251,8 @@
     var total = state.accounts.length;
     $('#tabAccountCount').textContent = total ? String(total) : '';
     $('#tabKeyCount').textContent = state.keys.length ? String(state.keys.length) : '';
+    var communityCount = state.community && state.community.total ? String(state.community.total) : '';
+    if ($('#tabCommunityCount')) { $('#tabCommunityCount').textContent = communityCount; }
     $$('#tabs .tab').forEach(function (btn) {
       btn.classList.toggle('active', btn.dataset.tab === state.tab);
     });
@@ -259,6 +286,8 @@
       loadEvents().then(renderLogs).catch(function (e) { toast(e.message, 'err'); });
     } else if (name === 'guard') {
       loadGuard().then(renderGuard).catch(function (e) { toast(e.message, 'err'); });
+    } else if (name === 'community') {
+      loadCommunity();
     } else if (name === 'settings') {
       loadSettings().then(renderSettings).catch(function (e) { toast(e.message, 'err'); });
     }
@@ -272,6 +301,7 @@
     else if (state.tab === 'usage') { renderUsage(); }
     else if (state.tab === 'guard') { renderGuard(); }
     else if (state.tab === 'logs') { renderLogs(); }
+    else if (state.tab === 'community') { renderCommunity(); }
     else if (state.tab === 'settings') { renderSettings(); }
   }
 
@@ -463,8 +493,11 @@
     var expanded = !!state.expanded[acc.id];
     var actions = [];
     if (acc.checkin_supported) {
-      actions.push('<button class="btn sm" type="button" data-action="acc-action" data-op="checkin" data-id="' +
-        esc(acc.id) + '">签到</button>');
+      var checkedToday = !!acc.last_checkin && acc.last_checkin === todayStr();
+      actions.push('<button class="btn sm' + (checkedToday ? ' soft' : '') +
+        '" type="button" data-action="acc-action" data-op="checkin" data-id="' +
+        esc(acc.id) + '" title="' + esc(acc.last_checkin_message || '') + '">' +
+        (checkedToday ? '已签到' : '签到') + '</button>');
     }
     actions.push('<button class="btn sm" type="button" data-action="acc-action" data-op="refresh" data-id="' +
       esc(acc.id) + '">刷新</button>');
@@ -598,10 +631,16 @@
         '" type="button" data-action="filter-model" data-filter="' + esc(ch.name) + '">' +
         esc(ch.label) + '</button>';
     });
+    var meta = state.modelsMeta || {};
+    var updated = Number(meta.updated_at || 0);
     view.innerHTML =
       '<div class="section-head" style="margin-top:0"><div><h2>模型目录</h2>' +
       '<div class="sub">模型 ID 可直接使用；给密钥绑定渠道后，同名模型也不会走错通道</div></div>' +
-      '<span class="pill">' + (state.models.filter(function (m) { return !m.alias; }).length) + ' 个模型</span></div>' +
+      '<div class="model-head-actions"><span class="pill">' +
+      (state.models.filter(function (m) { return !m.alias; }).length) + ' 个模型</span>' +
+      '<span class="faint model-updated" title="' + esc(updated ? fmtTime(updated) : '') + '">' +
+      esc(updated ? '上次更新 ' + timeAgo(updated) : '尚未更新') + '</span>' +
+      '<button class="btn sm soft" type="button" data-action="refresh-models">更新模型</button></div></div>' +
       '<div class="model-toolbar"><div class="search">' +
       '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
       '<circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>' +
@@ -665,6 +704,40 @@
           '<th>能力</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
       }).join('');
     root.innerHTML = html;
+  }
+
+  function refreshModels(btn) {
+    btn.disabled = true;
+    btn.textContent = '更新中…';
+    api('/api/models/refresh', { method: 'POST' }).then(function (data) {
+      var result = data.refresh || {};
+      return loadModels().then(function () {
+        renderModels();
+        var failures = [];
+        var remote = result.channels || {};
+        Object.keys(remote).forEach(function (name) {
+          var item = remote[name] || {};
+          if (!item.ok && item.message) {
+            failures.push(channelMeta(name).label + '：' + String(item.message).slice(0, 120));
+          }
+        });
+        var shown = state.models.filter(function (m) { return !m.alias; }).length;
+        if (Number(result.updated || 0) > 0) {
+          toast('模型目录已更新，共 ' + shown + ' 个模型' +
+            (failures.length ? '；' + failures.join('；') : ''), 'ok');
+        } else {
+          toast('更新失败' + (failures.length ? '：' + failures.join('；')
+            : '，没有获取到模型'), 'err');
+        }
+      });
+    }).catch(function (e) {
+      toast(e.message, 'err');
+      var button = $('[data-action="refresh-models"]');
+      if (button) {
+        button.disabled = false;
+        button.textContent = '更新模型';
+      }
+    });
   }
 
   // ------------------------------------------------------------------ keys
@@ -1168,6 +1241,225 @@
         : '<div class="card"><div class="empty"><strong>暂无日志</strong>操作后会实时记录。</div></div>');
   }
 
+  // ------------------------------------------------------------- community
+  function communityFirstChar(name) {
+    var text = String(name || '社');
+    var chars = Array.from ? Array.from(text) : text.split('');
+    return chars.length ? chars[0].toUpperCase() : '社';
+  }
+
+  function communityColor(name) {
+    var palette = ['#f4511e', '#2f6fed', '#17945c', '#b7791f',
+      '#7d4bd1', '#2f8f6b', '#c4552d', '#6d5ce7'];
+    var text = String(name || '');
+    var hash = 0;
+    for (var i = 0; i < text.length; i += 1) {
+      hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+    }
+    return palette[hash % palette.length];
+  }
+
+  function renderCommunityComment(comment, isReply) {
+    var author = comment.author || '社区用户';
+    var replies = (comment.replies || []).map(function (reply) {
+      return renderCommunityComment(reply, true);
+    }).join('');
+    return '<article class="community-item' + (isReply ? ' reply' : '') + '">' +
+      '<span class="community-avatar" aria-hidden="true" style="--avatar:' +
+      communityColor(author) + '">' + esc(communityFirstChar(author)) + '</span>' +
+      '<div class="community-main"><div class="community-meta"><strong>' + esc(author) + '</strong>' +
+      (comment.reply_to ? '<span class="community-reply-to">回复 ' + esc(comment.reply_to) + '</span>' : '') +
+      '<small>' + esc(timeAgo(comment.created_at)) + '</small></div>' +
+      '<div class="community-body">' + esc(comment.body || '（无正文）') + '</div></div></article>' +
+      (replies ? '<div class="community-replies">' + replies + '</div>' : '');
+  }
+
+  function loadCommunity(refresh) {
+    state.communityLoading = true;
+    state.communityError = '';
+    if (!state.community) { renderCommunity(); }
+    return api('/api/community/comments' + (refresh ? '?refresh=1' : ''))
+      .then(function (data) {
+        state.community = data.community || null;
+      })
+      .catch(function (e) {
+        state.communityError = e.message;
+      })
+      .then(function () {
+        state.communityLoading = false;
+        renderTabs();
+        renderCommunity();
+        return !state.communityError;
+      });
+  }
+
+  function communityAuth() {
+    var data = state.community || {};
+    return data.auth || { configured: false, logged_in: false, user: null, redirect_uri: '' };
+  }
+
+  function communityComposer() {
+    var auth = communityAuth();
+    var redirect = auth.redirect_uri || '';
+    if (!auth.configured) {
+      return '<div class="card community-compose"><div class="panel-head"><h3>在本机直接发言</h3>' +
+        '<span class="pill plain">需要若道账号</span></div><div class="panel-body">' +
+        '<div class="note info">要在面板里用若道账号发评论，先在若道开放平台建一个「公开客户端」，' +
+        '回调地址填下面这个，再把 client_id 填进来。一次配置，长期有效。</div>' +
+        '<div class="field"><label>回调地址（填到开放平台）</label><div class="key-box"><code>' +
+        esc(redirect) + '</code><button class="btn sm" type="button" data-copy="' +
+        esc(redirect) + '">复制</button></div></div>' +
+        '<div class="field"><label>OAuth Client ID</label><div class="community-inline">' +
+        '<input class="input" id="setCommunityClientId" placeholder="rdapp_xxxxxxxxxxxxxxxxxxxx">' +
+        '<button class="btn primary" type="button" data-action="save-community-client">保存</button></div>' +
+        '<div class="hint">保存后点「用若道账号登录」，授权完成即可在这里发评论；' +
+        '评论会同时出现在若道社区页。令牌只存在本机数据库。</div></div>' +
+        '<div class="community-empty-actions"><a class="btn" href="https://ruodao.com/open-platform" ' +
+        'target="_blank" rel="noopener noreferrer">打开开放平台</a></div>' +
+        '</div></div>';
+    }
+    if (!auth.logged_in) {
+      return '<div class="card community-compose"><div class="panel-head"><h3>在本机直接发言</h3>' +
+        '<span class="pill plain">未登录</span></div><div class="panel-body">' +
+        '<div class="note info">用若道账号登录后，就能在这里发评论和回复。评论只有一份，' +
+        '面板里发的会立刻出现在若道社区页，反过来也一样。</div>' +
+        '<div class="community-empty-actions"><button class="btn primary" type="button" ' +
+        'data-action="community-login">' + (state.communityAuthBusy ? '等待浏览器授权…' : '用若道账号登录') +
+        '</button><span class="faint">授权范围：openid · profile · app:comments</span></div>' +
+        '</div></div>';
+    }
+    var user = auth.user || {};
+    var draft = state.communityDraft || '';
+    var reply = state.communityReply;
+    return '<div class="card community-compose"><div class="panel-head"><h3>在本机直接发言</h3>' +
+      '<span class="pill green">已登录 · ' + esc(user.name || '若道用户') + '</span>' +
+      '<button class="btn sm" type="button" data-action="community-logout">退出登录</button></div>' +
+      '<div class="panel-body">' +
+      (reply ? '<div class="community-reply-banner">正在回复 <b>@' + esc(reply.author) + '</b>' +
+        '<button class="btn sm" type="button" data-action="cancel-reply">取消</button></div>' : '') +
+      '<textarea class="input community-input" id="communityDraft" rows="3" maxlength="1000" ' +
+      'placeholder="说说使用体验、提个建议，或者报告一个问题…">' + esc(draft) + '</textarea>' +
+      '<div class="community-compose-foot"><span class="faint" id="communityDraftCount">' +
+      draft.length + ' / 1000</span>' +
+      '<button class="btn primary" type="button" data-action="post-community"' +
+      (state.communityPosting ? ' disabled' : '') + '>' +
+      (state.communityPosting ? '发表中…' : (reply ? '发表回复' : '发表评论')) + '</button></div>' +
+      '</div></div>';
+  }
+
+  function renderCommunityComment(comment, isReply) {
+    var author = comment.author || '社区用户';
+    var auth = communityAuth();
+    var actions = '';
+    if (auth.logged_in && comment.id) {
+      actions += '<button class="community-link" type="button" data-action="reply-community" ' +
+        'data-id="' + esc(comment.id) + '" data-author="' + esc(author) + '">回复</button>';
+      if (comment.owner) {
+        actions += '<button class="community-link danger" type="button" data-action="delete-community" ' +
+          'data-id="' + esc(comment.id) + '">删除</button>';
+      }
+    }
+    var replies = (comment.replies || []).map(function (reply) {
+      return renderCommunityComment(reply, true);
+    }).join('');
+    return '<article class="community-item' + (isReply ? ' reply' : '') + '">' +
+      '<span class="community-avatar" aria-hidden="true" style="--avatar:' +
+      communityColor(author) + '">' + esc(communityFirstChar(author)) + '</span>' +
+      '<div class="community-main"><div class="community-meta"><strong>' + esc(author) + '</strong>' +
+      (comment.owner ? '<span class="community-badge">我</span>' : '') +
+      (comment.reply_to ? '<span class="community-reply-to">回复 ' + esc(comment.reply_to) + '</span>' : '') +
+      '<small>' + esc(timeAgo(comment.created_at)) + '</small>' +
+      (actions ? '<span class="community-item-actions">' + actions + '</span>' : '') +
+      '</div><div class="community-body">' + esc(comment.body || '（无正文）') + '</div></div></article>' +
+      (replies ? '<div class="community-replies">' + replies + '</div>' : '');
+  }
+
+  function loadCommunity(refresh) {
+    state.communityLoading = true;
+    state.communityError = '';
+    if (!state.community) { renderCommunity(); }
+    return api('/api/community/comments' + (refresh ? '?refresh=1' : ''))
+      .then(function (data) {
+        state.community = data.community || null;
+      })
+      .catch(function (e) {
+        state.communityError = e.message;
+      })
+      .then(function () {
+        state.communityLoading = false;
+        renderTabs();
+        renderCommunity();
+        return !state.communityError;
+      });
+  }
+
+  function renderCommunity() {
+    var view = $('#view-community');
+    if (!view) { return; }
+    var data = state.community;
+    var item = (data && data.item) || {};
+    var url = item.url || 'https://ruodao.com/open-source/ruodao2api#comments';
+    var docs = item.docs_url || 'https://ruodao.com/open-source/docs';
+    var comments = (data && data.comments) || [];
+    var total = Number((data && data.total) || 0);
+    var auth = communityAuth();
+    var body = '';
+    if (state.communityLoading && !data) {
+      body = '<div class="community-loading"><span class="spinner"></span>' +
+        '<span>正在读取若道社区…</span></div>';
+    } else if (state.communityError && !data) {
+      body = '<div class="empty"><strong>暂时读不到社区讨论</strong>' +
+        esc(state.communityError) +
+        '<div class="community-empty-actions">' +
+        '<button class="btn" type="button" data-action="refresh-community">重试</button>' +
+        '<a class="btn primary" href="' + esc(url) + '" target="_blank" ' +
+        'rel="noopener noreferrer">去若道查看</a></div></div>';
+    } else if (!comments.length) {
+      body = '<div class="empty"><strong>还没有人发言</strong>' +
+        '第一条评论会同时出现在这里和若道社区页，随便聊聊使用体验都行。' +
+        '<div class="community-empty-actions"><a class="btn" href="' + esc(url) +
+        '" target="_blank" rel="noopener noreferrer">在若道页面发言</a></div></div>';
+    } else {
+      body = '<div class="community-list">' + comments.map(function (comment) {
+        return renderCommunityComment(comment, false);
+      }).join('') + '</div>';
+    }
+    var warnings = data && data.warning
+      ? '<div class="note">' + esc(data.warning) + '</div>' : '';
+    if (state.communityError && data) {
+      warnings += '<div class="note error">' + esc(state.communityError) + '</div>';
+    }
+    var updated = data && data.fetched_at
+      ? '更新于 ' + timeAgo(data.fetched_at) : '等待同步';
+    view.innerHTML =
+      '<div class="section-head" style="margin-top:0"><div><h2>开源社区</h2>' +
+      '<div class="sub">评论同步若道开源社区；登录若道账号后可直接在这里发言</div></div>' +
+      '<div class="community-actions">' +
+      '<a class="btn" href="' + esc(docs) + '" target="_blank" rel="noopener noreferrer">接入文档</a>' +
+      '<button class="btn" type="button" data-action="refresh-community"' +
+      (state.communityLoading ? ' disabled' : '') + '>' +
+      (state.communityLoading && data ? '刷新中…' : '刷新') + '</button>' +
+      '<a class="btn primary" href="' + esc(url) + '" target="_blank" ' +
+      'rel="noopener noreferrer">去若道参与讨论</a></div></div>' +
+      '<div class="card community-project"><div class="community-project-main">' +
+      '<span class="community-mark">R</span><div>' +
+      '<div class="community-project-title">' + esc(item.title || '若道 2API') + '</div>' +
+      '<div class="community-project-sub">开源产品 · 与官网讨论同步</div></div></div>' +
+      '<div class="community-project-meta"><span class="pill orange">开源社区</span>' +
+      (auth.logged_in ? '<span class="pill green">已登录若道</span>' : '') +
+      '<span class="faint">' + (total ? '共 ' + num(total) + ' 条讨论 · ' : '') +
+      (comments.length && total > comments.length
+        ? '显示最近 ' + num(comments.length) + ' 条 · ' : '') +
+      esc(updated) + (data && data.cached ? ' · 缓存' : '') + '</span></div></div>' +
+      warnings +
+      communityComposer() +
+      '<div class="card" style="margin-top:14px;overflow:hidden">' +
+      '<div class="panel-head"><h3>讨论</h3>' +
+      '<span class="pill plain">内容来自 ruodao.com</span></div>' + body + '</div>' +
+      '<div class="community-note">评论正文只存在若道，不在本机另存一份；' +
+      '本机只保存若道登录令牌与公开内容缓存，不会上传你的账号、密钥或调用记录。</div>';
+  }
+
   // -------------------------------------------------------------- settings
   function toggleHtml(key, on) {
     return '<button type="button" class="toggle ' + (on ? 'on' : '') + '" data-toggle="' + key +
@@ -1372,6 +1664,7 @@
         '" type="button" data-realm-opt="' + esc(opt[0]) + '">' + esc(opt[1]) + '</button>';
     }).join('');
     return '<div class="field"><label>区域 / 版本</label><div class="filters">' + chips + '</div>' +
+      (meta.realm_hint ? '<div class="hint">' + esc(meta.realm_hint) + '</div>' : '') +
       '<input type="hidden" id="addRealm" value="' + esc(selected) + '"></div>';
   }
 
@@ -1705,16 +1998,25 @@
   function renderScan() {
     var root = $('#scanResult');
     if (!root) { return; }
-    var items = state.scan || [];
+    var all = state.scan || [];
+    var realm = currentRealm();
+    var filterRealm = state.add && state.add.channel === 'qoder' && realm;
+    var items = filterRealm ? all.filter(function (i) { return i.realm === realm; }) : all;
     if (!items.length) {
-      root.innerHTML = '<div class="note" style="margin-top:12px;margin-bottom:0">未发现本地登录凭证。' +
-        '请先登录对应客户端，或改用 OAuth / 手动凭证。</div>';
+      var hint = all.length && filterRealm
+        ? '当前选择的「' + realmLabelOf(state.add.channel, realm) + '」未发现本地凭证；' +
+          '本机检测到其他版本，请切换上方「区域 / 版本」后重试。'
+        : '未发现本地登录凭证。请先登录对应客户端，或改用 OAuth / 手动凭证。';
+      root.innerHTML = '<div class="note" style="margin-top:12px;margin-bottom:0">' +
+        esc(hint) + '</div>';
       return;
     }
     var rows = items.map(function (item) {
       var meta = [];
       if (item.path) { meta.push(item.path); }
-      if (item.realm) { meta.push(item.realm); }
+      if (item.realm) {
+        meta.push(item.realm_label || realmLabelOf(state.add.channel, item.realm) || item.realm);
+      }
       if (item.uid) { meta.push('UID ' + item.uid); }
       if (item.expires_at) { meta.push('到期 ' + fmtTime(item.expires_at)); }
       var badge = item.encrypted ?
@@ -1728,9 +2030,12 @@
     var warning = items.some(function (i) { return i.encrypted; }) ?
       '<div class="note" style="margin-top:12px">部分凭证由客户端加密保存，无法离线解密，' +
       '请改用 OAuth 登录或手动导入。</div>' : '';
+    var importLabel = filterRealm
+      ? '导入' + realmLabelOf(state.add.channel, realm) + '账号'
+      : '导入全部可识别账号';
     root.innerHTML = '<div class="scan-list">' + rows + '</div>' + warning +
       '<button class="btn primary block" type="button" data-action="import-local" style="margin-top:12px">' +
-      '导入全部可识别账号</button>';
+      esc(importLabel) + '</button>';
   }
 
   function importLocal(btn) {
@@ -1770,7 +2075,9 @@
       .then(function (res) {
         if (op === 'checkin') {
           var result = res.result || {};
-          toast(result.message || result.error || '签到完成', result.ok === false ? 'err' : 'ok');
+          var kind = result.ok === false ? 'err'
+            : (Number(result.earned) > 0 ? 'ok' : '');
+          toast(result.message || result.error || '签到完成', kind);
         } else if (op === 'refresh') {
           toast(res.changed ? '凭证已刷新' : '刷新完成', 'ok');
         } else if (op === 'test') {
@@ -1813,6 +2120,125 @@
     });
   }
 
+  function communityLogin(btn) {
+    if (state.communityAuthBusy) { return; }
+    btn.disabled = true;
+    api('/api/community/auth/start', { method: 'POST', body: {} })
+      .then(function (res) {
+        var started = res.auth || {};
+        state.communityAuthBusy = true;
+        renderCommunity();
+        window.open(started.authorize_url, '_blank', 'noopener');
+        startCommunityPoll();
+      })
+      .catch(function (e) {
+        toast(e.message, 'err');
+        btn.disabled = false;
+      });
+  }
+
+  function startCommunityPoll() {
+    stopCommunityPoll();
+    var tries = 0;
+    state.communityPoll = setInterval(function () {
+      tries += 1;
+      api('/api/community/auth').then(function (res) {
+        var auth = res.auth || {};
+        if (auth.logged_in) {
+          stopCommunityPoll();
+          state.communityAuthBusy = false;
+          toast('已登录若道账号', 'ok');
+          loadCommunity(true);
+        } else if (tries > 90) {
+          stopCommunityPoll();
+          state.communityAuthBusy = false;
+          renderCommunity();
+          toast('没等到授权结果，可以再点一次登录', 'err');
+        }
+      }).catch(function () { /* 轮询失败忽略，下一轮重试 */ });
+    }, 2000);
+  }
+
+  function stopCommunityPoll() {
+    if (state.communityPoll) {
+      clearInterval(state.communityPoll);
+      state.communityPoll = null;
+    }
+  }
+
+  function communityLogout(btn) {
+    btn.disabled = true;
+    api('/api/community/auth/logout', { method: 'POST', body: {} })
+      .then(function () {
+        state.communityReply = null;
+        state.communityDraft = '';
+        toast('已退出若道账号', 'ok');
+        return loadCommunity(true);
+      })
+      .catch(function (e) {
+        toast(e.message, 'err');
+        btn.disabled = false;
+      });
+  }
+
+  function postCommunity(btn) {
+    var box = $('#communityDraft');
+    var text = (box ? box.value : state.communityDraft || '').trim();
+    if (!text) { toast('先写点什么再发', 'err'); return; }
+    if (text.length > 1000) { toast('评论最多 1000 字', 'err'); return; }
+    var payload = { body: text };
+    if (state.communityReply && state.communityReply.id) {
+      payload.parent_comment_id = state.communityReply.id;
+    }
+    state.communityPosting = true;
+    btn.disabled = true;
+    api('/api/community/comments', { method: 'POST', body: payload })
+      .then(function () {
+        state.communityPosting = false;
+        state.communityDraft = '';
+        state.communityReply = null;
+        toast('已发表到若道社区', 'ok');
+        return loadCommunity(true);
+      })
+      .catch(function (e) {
+        state.communityPosting = false;
+        toast(e.message, 'err');
+        // 登录失效时顺手刷新一次，让编辑器回到正确的登录状态
+        if (String(e.message || '').indexOf('登录') >= 0) { loadCommunity(true); }
+        else { renderCommunity(); }
+      });
+  }
+
+  function deleteCommunity(btn) {
+    if (!window.confirm('删除这条评论？删除后若道社区页也会一起消失。')) { return; }
+    btn.disabled = true;
+    api('/api/community/comments/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' })
+      .then(function () {
+        toast('评论已删除', 'ok');
+        return loadCommunity(true);
+      })
+      .catch(function (e) {
+        toast(e.message, 'err');
+        btn.disabled = false;
+      });
+  }
+
+  function saveCommunityClient(btn) {
+    var input = $('#setCommunityClientId');
+    var value = input ? input.value.trim() : '';
+    if (!value) { toast('请填写 OAuth Client ID', 'err'); return; }
+    btn.disabled = true;
+    api('/api/settings', { method: 'PUT', body: { community_client_id: value } })
+      .then(function () {
+        toast('已保存，接着点「用若道账号登录」', 'ok');
+        return loadCommunity(true);
+      })
+      .catch(function (e) {
+        toast(e.message, 'err');
+        btn.disabled = false;
+      });
+  }
+
   function handleAction(action, el) {
     var type = action.dataset.action;
     if (type === 'open-add') {
@@ -1836,6 +2262,8 @@
     } else if (type === 'filter-model') {
       state.modelFilter = action.dataset.filter || 'all';
       renderModels();
+    } else if (type === 'refresh-models') {
+      refreshModels(action);
     } else if (type === 'usage-range') {
       state.usageRange = Number(action.dataset.range || 86400);
       loadUsage().then(renderUsage).catch(function (e) { toast(e.message, 'err'); });
@@ -1900,11 +2328,46 @@
       loadUsage().then(renderUsage).catch(function (e) { toast(e.message, 'err'); });
     } else if (type === 'refresh-logs') {
       loadEvents().then(renderLogs).catch(function (e) { toast(e.message, 'err'); });
+    } else if (type === 'community-login') {
+      communityLogin(action);
+    } else if (type === 'community-logout') {
+      communityLogout(action);
+    } else if (type === 'post-community') {
+      postCommunity(action);
+    } else if (type === 'reply-community') {
+      state.communityReply = { id: action.dataset.id, author: action.dataset.author };
+      renderCommunity();
+      var replyBox = $('#communityDraft');
+      if (replyBox) { replyBox.focus(); }
+    } else if (type === 'cancel-reply') {
+      state.communityReply = null;
+      renderCommunity();
+    } else if (type === 'delete-community') {
+      deleteCommunity(action);
+    } else if (type === 'save-community-client') {
+      saveCommunityClient(action);
+    } else if (type === 'refresh-community') {
+      loadCommunity(true).then(function (ok) {
+        if (!ok) {
+          toast(state.communityError || '社区刷新失败', 'err');
+        } else if (state.community && state.community.stale) {
+          toast(state.community.warning || '暂时无法连接若道社区', 'err');
+        } else {
+          toast('社区讨论已刷新', 'ok');
+        }
+      });
     }
   }
 
   // ---------------------------------------------------------------- bindings
   function bind() {
+    document.addEventListener('input', function (event) {
+      if (event.target && event.target.id === 'communityDraft') {
+        state.communityDraft = event.target.value;
+        var counter = $('#communityDraftCount');
+        if (counter) { counter.textContent = event.target.value.length + ' / 1000'; }
+      }
+    });
     document.addEventListener('click', function (event) {
       var closeBtn = event.target.closest('[data-close]');
       if (closeBtn) { closeModal(); return; }
@@ -1917,6 +2380,7 @@
         $$('.chip', group).forEach(function (chip) { chip.classList.toggle('active', chip === realmOpt); });
         var hidden = $('#addRealm');
         if (hidden) { hidden.value = realmOpt.dataset.realmOpt; }
+        if (state.scan && state.add) { renderScan(); }
         return;
       }
       var method = event.target.closest('[data-method]');
@@ -2009,6 +2473,13 @@
         renderStatus();
         renderTabContent();
         if (state.tab !== 'usage') { renderOverview(); }
+        if (state.tab === 'community') {
+          // 正在写评论时不要重绘，避免输入框被刷新掉
+          var draftBox = document.activeElement;
+          var composing = state.communityDraft ||
+            (draftBox && draftBox.closest && draftBox.closest('#view-community .community-input'));
+          if (!composing) { loadCommunity(); }
+        }
         var addChannel = new URLSearchParams(location.search).get('add');
         if (['qoder', 'codebuddy', 'zcode', 'gpt'].indexOf(addChannel) >= 0) {
           openAddChannel(addChannel);

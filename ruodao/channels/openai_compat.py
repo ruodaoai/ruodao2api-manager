@@ -125,6 +125,42 @@ class OpenAICompatChannel(BaseChannel):
             self._catalog[acc_id] = (time.time(), models)
         return models
 
+    def refresh_catalog(self, account=None):
+        accounts = [account] if account else [
+            a for a in self.app.accounts.list("gpt") if a.get("enabled")]
+        with self._lock:
+            self._catalog.clear()
+        rows = []
+        errors = []
+        for acc in accounts:
+            if not acc.get("enabled"):
+                continue
+            models = _models_of(acc) or self._fetch_models(acc)
+            if not models:
+                errors.append("%s：没有可用模型"
+                              % (acc.get("name") or acc.get("id")))
+                continue
+            with self._lock:
+                self._catalog[acc.get("id") or ""] = (time.time(), list(models))
+            for model in models:
+                rows.append({
+                    "id": "gpt/%s" % model,
+                    "raw_id": model,
+                    "object": "model",
+                    "channel": self.name,
+                    "channel_label": self.label,
+                    "realm": acc.get("realm") or "",
+                    "realm_label": acc.get("name") or "自定义",
+                    "owned_by": str((acc.get("data") or {}).get("name")
+                                    or "OpenAI Compatible"),
+                    "display_name": model,
+                    "created": 0,
+                    "context_length": 128000,
+                    "capabilities": {"tools": True},
+                })
+        return {"ok": bool(rows), "models": rows, "source": "实时",
+                "persist": False, "message": "；".join(errors)}
+
     def _fetch_models(self, account):
         base = _base_url((account.get("data") or {}).get("base_url"))
         if not base:

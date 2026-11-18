@@ -36,6 +36,12 @@ DEFAULTS = {
     "guard_queue_timeout": 30,
     "guard_cooldown_429": 180,
     "guard_cooldown_5xx": 30,
+    # 若道开源社区（评论与账号互通）
+    "community_base": "https://ruodao.com",
+    "community_slug": "ruodao2api",
+    "community_client_id": "",
+    "community_redirect_uri": "",
+    "community_timeout": 15,
 }
 
 

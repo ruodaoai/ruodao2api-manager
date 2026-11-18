@@ -250,10 +250,99 @@ class ZCodeChannel(BaseChannel):
         self._lock = threading.Lock()
 
     # -- models -----------------------------------------------------------
+    def _snapshot_rows(self, realm):
+        catalog = getattr(self.app, "models_catalog", None)
+        if not catalog:
+            return []
+        try:
+            return catalog.rows(self.name, realm)
+        except Exception:
+            return []
+
+    def _models_for(self, realm):
+        base = [dict(m) for m in MODELS]
+        rows = self._snapshot_rows(realm)
+        if not rows:
+            return base
+        by_id = {m["id"]: m for m in base}
+        order = [m["id"] for m in base]
+        for row in rows:
+            mid = str(row.get("raw_id") or "").strip()
+            if not mid:
+                continue
+            caps = row.get("capabilities") or {}
+            item = {
+                "id": mid,
+                "name": row.get("display_name") or mid,
+                "context": row.get("context_length") or 200000,
+                "max_output": row.get("max_output_tokens") or 64000,
+                "reasoning": bool(caps.get("reasoning")),
+                "vision": bool(caps.get("vision")),
+            }
+            if mid not in by_id:
+                order.append(mid)
+            by_id[mid] = item
+        return [by_id[mid] for mid in order if mid in by_id]
+
+    def _rows_for_realm(self, realm, models):
+        return [self._model_dict(realm, model) for model in (models or [])]
+
+    def refresh_catalog(self, account=None):
+        accounts = [account] if account else [
+            a for a in self.app.accounts.list("zcode") if a.get("enabled")]
+        rows = []
+        errors = []
+        for realm in ("zai", "bigmodel"):
+            realm_accounts = [a for a in accounts
+                              if _realm_of(a.get("data") or {}) == realm]
+            if not realm_accounts:
+                continue
+            acc = realm_accounts[0]
+            try:
+                credential = self._ensure_credential(acc)
+            except Exception as exc:
+                errors.append("%s：%s" % (_realm(realm)["name"], exc))
+                continue
+            if not credential:
+                errors.append("%s：没有可用的 API Key" % _realm(realm)["name"])
+                continue
+            headers = _identity_headers()
+            headers["Authorization"] = "Bearer " + credential
+            headers["Accept"] = "application/json"
+            try:
+                status, obj, raw = util.http_json(
+                    _realm(realm)["openai_base"] + "/models",
+                    headers=headers, timeout=25)
+            except Exception as exc:
+                errors.append("%s：%s" % (_realm(realm)["name"], exc))
+                continue
+            if status >= 400:
+                errors.append("%s：HTTP %s %s"
+                              % (_realm(realm)["name"], status, str(raw)[:120]))
+                continue
+            items = obj.get("data") if isinstance(obj, dict) else obj
+            live = []
+            for item in items or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                mid = str(item["id"])
+                known = _MODEL_BY_ID.get(mid) or {}
+                merged = dict(known)
+                merged["id"] = mid
+                merged["name"] = str(item.get("display_name") or item.get("name")
+                                     or known.get("name") or mid)
+                live.append(merged)
+            if not live:
+                errors.append("%s：上游返回空模型列表" % _realm(realm)["name"])
+                continue
+            rows.extend(self._rows_for_realm(realm, live))
+        return {"ok": bool(rows), "models": rows, "source": "实时",
+                "message": "；".join(errors)}
+
     def list_models(self, account=None):
         out = []
         for realm in ("zai", "bigmodel"):
-            for model in MODELS:
+            for model in self._models_for(realm):
                 out.append(self._model_dict(realm, model))
         return out
 
@@ -296,8 +385,10 @@ class ZCodeChannel(BaseChannel):
             realm, raw = "zai", raw[4:]
         elif low.startswith("bigmodel/"):
             realm, raw = "bigmodel", raw[9:]
-        model = _MODEL_BY_ID.get(raw)
-        if not realm:
+        model = None
+        if realm:
+            realms = [realm]
+        else:
             accounts = self.app.accounts.list("zcode") if getattr(self.app, "accounts", None) else []
             if any(a.get("realm") == "zai" and a.get("enabled") for a in accounts):
                 realm = "zai"
@@ -305,6 +396,15 @@ class ZCodeChannel(BaseChannel):
                 realm = "bigmodel"
             else:
                 realm = "zai"
+            realms = [realm] + [r for r in ("zai", "bigmodel") if r != realm]
+        for candidate in realms:
+            for item in self._models_for(candidate):
+                if item.get("id") == raw:
+                    model = item
+                    realm = candidate
+                    break
+            if model:
+                break
         if model:
             out = self._model_dict(realm, model)
             out["meta"] = model

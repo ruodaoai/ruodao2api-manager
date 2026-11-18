@@ -13,6 +13,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import util
+from .community import render_callback_page
 from .errors import UpstreamError
 from .protocols.responses import ResponseStore, ResponsesStreamTranslator
 from .protocols.translate import (
@@ -825,7 +826,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._json(200, {"channels": self.runtime.channel_list()})
                 return
             if path == "/api/models" and method == "GET":
-                self._json(200, {"object": "list", "data": self._model_payload()})
+                self._json(200, {"object": "list", "data": self._model_payload(),
+                                 "meta": self.runtime.models_meta()})
+                return
+            if path == "/api/models/refresh" and method == "POST":
+                result = self.runtime.refresh_models()
+                self._json(200, {"ok": True, "refresh": result})
                 return
             if path == "/api/accounts" and method == "GET":
                 channel = (util.query_string(self).get("channel") or [""])[0]
@@ -894,6 +900,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._json(200, {"events": self.runtime.store.events(
                     int((qs.get("limit") or ["100"])[0]))})
                 return
+            if path == "/api/community/comments" and method == "GET":
+                qs = util.query_string(self)
+                refresh = (qs.get("refresh") or ["0"])[0].lower() in (
+                    "1", "true", "yes")
+                self._json(200, {"ok": True, "community":
+                                 self.runtime.community.snapshot(refresh=refresh)})
+                return
+            if path.startswith("/api/community/"):
+                if self._handle_community(method, path):
+                    return
             if path == "/api/settings" and method == "GET":
                 self._json(200, self._settings_view())
                 return
@@ -974,7 +990,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         allowed = ("checkin_enabled", "checkin_times", "refresh_time",
                    "credits_refresh_minutes", "scheduler_enabled",
-                   "request_timeout", "max_body_mb") + self.GUARD_KEYS
+                   "request_timeout", "max_body_mb") + self.GUARD_KEYS \
+            + self.COMMUNITY_KEYS
         patch = {k: body[k] for k in allowed if k in body}
         self.runtime.config.update(patch)
         if self.runtime.scheduler:
@@ -987,6 +1004,62 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.runtime.config.update(patch)
         self.runtime.log("INFO", "防护参数已更新")
         self._json(200, {"ok": True, "guard": self.runtime.guard.snapshot()})
+
+    # -- 若道开源社区 ------------------------------------------------------
+    COMMUNITY_KEYS = ("community_base", "community_slug",
+                      "community_client_id", "community_redirect_uri",
+                      "community_timeout")
+
+    def _html(self, status, text):
+        payload = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _handle_community(self, method, path):
+        """社区评论与若道账号登录。返回 True 表示请求已处理。"""
+        client = self.runtime.community
+        if path == "/api/community/auth/callback" and method == "GET":
+            qs = util.query_string(self)
+            pairs = []
+            for key, values in qs.items():
+                for value in values:
+                    pairs.append("%s=%s" % (urllib.parse.quote(key),
+                                            urllib.parse.quote(value)))
+            ok, message = client.complete_auth("&".join(pairs))
+            self._html(200 if ok else 400,
+                       render_callback_page(ok, message))
+            return True
+        if path == "/api/community/auth/start" and method == "POST":
+            started = client.start_auth()
+            self._json(200, {"ok": True, "auth": started})
+            return True
+        if path == "/api/community/auth/logout" and method == "POST":
+            client.logout()
+            self._json(200, {"ok": True, "auth": client.auth_status()})
+            return True
+        if path == "/api/community/auth" and method == "GET":
+            self._json(200, {"ok": True, "auth": client.auth_status()})
+            return True
+        if path == "/api/community/comments" and method == "POST":
+            body = self._read_json()
+            result = client.post(body.get("body"),
+                                 body.get("parent_comment_id")
+                                 or body.get("parentCommentId") or "")
+            self._json(200, result)
+            return True
+        if path.startswith("/api/community/comments/") and method == "DELETE":
+            comment_id = path[len("/api/community/comments/"):].strip("/")
+            self._json(200, client.delete(comment_id))
+            return True
+        return False
 
     def _admin_create_account(self):
         body = self._read_json()
@@ -1074,8 +1147,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             raise UpstreamError("渠道不存在", status=400)
         if action == "checkin":
             result = channel.checkin(account)
+            usage = self.runtime.accounts.refresh_balance(account, force=True)
             self.runtime.accounts.save(account)
-            self._json(200, {"ok": True, "result": result,
+            self._json(200, {"ok": True, "result": result, "usage": usage,
                              "account": self.runtime.accounts.public(account)})
             return
         if action == "refresh":

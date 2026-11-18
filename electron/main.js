@@ -14,6 +14,8 @@ const APP_NAME = "Ruodao2API";
 const PORT_START = Number(process.env.RUDAO_DESKTOP_PORT || 8388);
 const PORT_TRIES = 20;
 const HEALTH_TIMEOUT = 45000;
+const SPAWN_RETRY_LIMIT = 20;
+const SPAWN_RETRY_MS = 2000;
 
 let backendChild = null;
 let backendSpawned = false;
@@ -165,31 +167,81 @@ function backendCommand(port) {
   };
 }
 
-function startBackend(port) {
+// 安全软件会在新解压的 exe 上停留扫描，Windows 下表现为 spawn EBUSY；
+// 等待扫描结束后重试，避免在启动阶段直接失败。
+function spawnBackendProcess(spec) {
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    const retry = (err) => {
+      const code = err && err.code;
+      const retryable = !code || code === "EBUSY" || code === "EPERM" ||
+        code === "EACCES" || code === "UNKNOWN";
+      if (!retryable || attempt >= SPAWN_RETRY_LIMIT) {
+        reject(err);
+        return;
+      }
+      log("backend spawn retry " + attempt + " (" + (code || err.message) + ")");
+      setTimeout(attemptSpawn, SPAWN_RETRY_MS);
+    };
+    const attemptSpawn = () => {
+      attempt += 1;
+      let child = null;
+      try {
+        child = spawn(spec.command, spec.args, {
+          cwd: spec.cwd,
+          env: spec.env,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (err) {
+        retry(err);
+        return;
+      }
+      const onError = (err) => {
+        child.removeListener("spawn", onSpawn);
+        retry(err);
+      };
+      const onSpawn = () => {
+        child.removeListener("error", onError);
+        resolve(child);
+      };
+      child.once("error", onError);
+      child.once("spawn", onSpawn);
+    };
+    attemptSpawn();
+  });
+}
+
+async function startBackend(port) {
   const spec = backendCommand(port);
   if (!IS_DEV && !fs.existsSync(spec.command)) {
-    throw new Error("未找到内置后端：" + spec.command);
+    throw new Error("内置后端文件不存在（可能被杀毒软件清理）：" + spec.command);
   }
   ensureDir(dataDir());
   ensureDir(path.dirname(backendLogPath));
   logStream = fs.createWriteStream(backendLogPath, { flags: "a" });
   logStream.write("\n===== " + new Date().toISOString() + " start " + spec.command + " =====\n");
   log("spawn backend: " + spec.command + " " + spec.args.join(" "));
-  backendChild = spawn(spec.command, spec.args, {
-    cwd: spec.cwd,
-    env: spec.env,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let child = null;
+  try {
+    child = await spawnBackendProcess(spec);
+  } catch (err) {
+    log("backend spawn failed: " + (err && err.message ? err.message : err));
+    throw new Error(
+      "后台服务无法启动：" + ((err && err.message) || err) +
+      "。若安装了 360、火绒等安全软件，请将本程序加入信任区后重试。",
+    );
+  }
+  backendChild = child;
   backendSpawned = true;
-  backendChild.stdout.pipe(logStream, { end: false });
-  backendChild.stderr.pipe(logStream, { end: false });
-  backendChild.on("error", (err) => {
+  child.stdout.pipe(logStream, { end: false });
+  child.stderr.pipe(logStream, { end: false });
+  child.on("error", (err) => {
     log("backend spawn error: " + err.message);
     backendSpawned = false;
     backendChild = null;
   });
-  backendChild.on("exit", (code, signal) => {
+  child.on("exit", (code, signal) => {
     log("backend exited code=" + code + " signal=" + signal);
     if (!isQuitting && !restarting) {
       backendSpawned = false;
@@ -197,7 +249,8 @@ function startBackend(port) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         showStartupError(
           "后台服务已退出",
-          "退出码：" + code + (signal ? "，信号：" + signal : "") + "。请查看后台日志后重试。",
+          "退出码：" + code + (signal ? "，信号：" + signal : "") +
+            "。请查看后台日志后重试。若安装了 360、火绒等安全软件，请将本程序加入信任区。",
         );
       }
     }
@@ -331,7 +384,7 @@ async function boot() {
       backendChild = null;
       log("reuse gateway " + baseUrl);
     } else {
-      startBackend(backendPort);
+      await startBackend(backendPort);
       const ready = await waitForHealth(backendPort, HEALTH_TIMEOUT);
       if (!ready) {
         throw new Error("后台服务在 " + Math.round(HEALTH_TIMEOUT / 1000) + " 秒内没有就绪");
@@ -356,7 +409,7 @@ async function restartBackend() {
   stopBackend();
   setTimeout(async () => {
     try {
-      startBackend(backendPort);
+      await startBackend(backendPort);
       const ready = await waitForHealth(backendPort, HEALTH_TIMEOUT);
       if (ready) {
         restarting = false;
@@ -458,9 +511,14 @@ function registerIpc() {
       return false;
     }
   });
-  ipcMain.on("desktop:retry", () => {
+  ipcMain.on("desktop:retry", async () => {
     if (!backendSpawned && backendChild === null) {
-      startBackend(backendPort);
+      try {
+        await startBackend(backendPort);
+      } catch (err) {
+        showStartupError("后台服务启动失败", String((err && err.message) || err));
+        return;
+      }
     }
     waitForHealth(backendPort, HEALTH_TIMEOUT).then((ok) => {
       if (ok) {
