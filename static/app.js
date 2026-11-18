@@ -15,6 +15,9 @@
     communityLoading: false,
     communityError: '',
     communityDraft: '',
+    communityImages: [],
+    communityUploading: 0,
+    communityDrag: false,
     communityReply: null,
     communityPosting: false,
     tab: 'overview',
@@ -1284,19 +1287,42 @@
     var who = user.name || user.email || '若道用户';
     var draft = state.communityDraft || '';
     var reply = state.communityReply;
+    var images = state.communityImages || [];
+    var uploading = state.communityUploading > 0;
+    var full = images.length >= 4;
+    var thumbs = images.map(function (img, index) {
+      return '<figure class="community-thumb">' +
+        '<img src="' + esc(img.url) + '" alt="' + esc(img.name || '图片') + '" loading="lazy">' +
+        '<button class="community-thumb-x" type="button" title="移除这张图" ' +
+        'data-action="remove-community-image" data-index="' + index + '">×</button></figure>';
+    }).join('');
+    if (uploading) {
+      thumbs += '<div class="community-thumb is-uploading"><span class="spinner"></span>' +
+        '<small>上传中</small></div>';
+    }
     return '<div class="card community-compose"><div class="panel-head"><h3>在本机直接发言</h3>' +
       '<span class="pill green">已登录 · ' + esc(who) + '</span>' +
       '<button class="btn sm" type="button" data-action="community-logout">退出登录</button></div>' +
       '<div class="panel-body">' +
       (reply ? '<div class="community-reply-banner">正在回复 <b>@' + esc(reply.author) + '</b>' +
         '<button class="btn sm" type="button" data-action="cancel-reply">取消</button></div>' : '') +
+      ((thumbs || state.communityDrag) ? '<div class="community-attachments' +
+        (state.communityDrag ? ' is-drag' : '') + '">' + thumbs +
+        (state.communityDrag ? '<div class="community-drop-hint">松手就能上传图片</div>' : '') +
+        '</div>' : '') +
       '<textarea class="input community-input" id="communityDraft" rows="3" maxlength="1000" ' +
-      'placeholder="说说使用体验、提个建议，或者报告一个问题…">' + esc(draft) + '</textarea>' +
-      '<div class="community-compose-foot"><span class="faint" id="communityDraftCount">' +
-      draft.length + ' / 1000</span>' +
+      'placeholder="说说使用体验、提个建议，或者报告一个问题…（可以粘贴截图）">' + esc(draft) + '</textarea>' +
+      '<div class="community-compose-foot">' +
+      '<label class="btn sm community-attach' + (full ? ' is-disabled' : '') + '" title="' +
+      (full ? '一条评论最多 4 张图片' : '选择图片，或直接把截图粘贴进输入框') + '">' +
+      '<input type="file" id="communityImageInput" accept="image/png,image/jpeg,image/webp,image/gif" ' +
+      'multiple hidden' + (full ? ' disabled' : '') + '>添加图片</label>' +
+      '<span class="faint" id="communityDraftCount">' + draft.length + ' / 1000 · 图片 ' +
+      images.length + '/4</span>' +
       '<button class="btn primary" type="button" data-action="post-community"' +
-      (state.communityPosting ? ' disabled' : '') + '>' +
-      (state.communityPosting ? '发表中…' : (reply ? '发表回复' : '发表评论')) + '</button></div>' +
+      ((state.communityPosting || uploading) ? ' disabled' : '') + '>' +
+      (state.communityPosting ? '发表中…' :
+        (uploading ? '图片上传中…' : (reply ? '发表回复' : '发表评论'))) + '</button></div>' +
       '</div></div>';
   }
 
@@ -1323,7 +1349,15 @@
       (comment.reply_to ? '<span class="community-reply-to">回复 ' + esc(comment.reply_to) + '</span>' : '') +
       '<small>' + esc(timeAgo(comment.created_at)) + '</small>' +
       (actions ? '<span class="community-item-actions">' + actions + '</span>' : '') +
-      '</div><div class="community-body">' + esc(comment.body || '（无正文）') + '</div></div></article>' +
+      '</div>' +
+      (comment.body ? '<div class="community-body">' + esc(comment.body) + '</div>' : '') +
+      ((comment.images || []).length ?
+        '<div class="community-images">' + comment.images.map(function (url) {
+          return '<a class="community-image" href="' + esc(url) + '" target="_blank" ' +
+            'rel="noopener noreferrer"><img src="' + esc(url) + '" alt="评论图片" ' +
+            'loading="lazy"></a>';
+        }).join('') + '</div>' : '') +
+      '</div></article>' +
       (replies ? '<div class="community-replies">' + replies + '</div>' : '');
   }
 
@@ -2120,12 +2154,87 @@
       });
   }
 
+  function communityFocusDraft() {
+    var box = $('#communityDraft');
+    if (!box) { return; }
+    box.focus();
+    try { box.setSelectionRange(box.value.length, box.value.length); } catch (e) { /* ignore */ }
+  }
+
+  function communityAddFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) { return; }
+    var current = state.communityImages || [];
+    var room = 4 - current.length - state.communityUploading;
+    if (room <= 0) {
+      toast('一条评论最多 4 张图片', 'err');
+      return;
+    }
+    var picked = files.filter(function (file) {
+      return /^image\//.test(file.type || '');
+    });
+    if (!picked.length) {
+      toast('只能上传图片（PNG / JPG / WebP / GIF）', 'err');
+      return;
+    }
+    if (picked.length > room) {
+      toast('最多再放 ' + room + ' 张，多余的已经跳过', 'err');
+      picked = picked.slice(0, room);
+    }
+    picked.forEach(function (file) {
+      if (file.size > 8 * 1024 * 1024) {
+        toast((file.name || '这张图') + ' 超过 8 MB，已跳过', 'err');
+        return;
+      }
+      state.communityUploading += 1;
+      renderCommunity();
+      var reader = new FileReader();
+      reader.onload = function () {
+        api('/api/community/upload', {
+          method: 'POST',
+          body: {
+            filename: file.name || 'image.png',
+            content_type: file.type || '',
+            data: String(reader.result || ''),
+          },
+        }).then(function (res) {
+          state.communityImages.push({ url: res.url, name: res.name || file.name });
+          toast('图片已上传', 'ok');
+        }).catch(function (e) {
+          toast(e.message, 'err');
+          if (String(e.message || '').indexOf('登录') >= 0) { loadCommunity(true); }
+        }).then(function () {
+          state.communityUploading = Math.max(0, state.communityUploading - 1);
+          renderCommunity();
+          communityFocusDraft();
+        });
+      };
+      reader.onerror = function () {
+        state.communityUploading = Math.max(0, state.communityUploading - 1);
+        toast('这张图读不出来，换一张试试', 'err');
+        renderCommunity();
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function communityRemoveImage(index) {
+    var images = state.communityImages || [];
+    var pos = Number(index);
+    if (!isFinite(pos) || pos < 0 || pos >= images.length) { return; }
+    images.splice(pos, 1);
+    renderCommunity();
+    communityFocusDraft();
+  }
+
   function postCommunity(btn) {
     var box = $('#communityDraft');
     var text = (box ? box.value : state.communityDraft || '').trim();
-    if (!text) { toast('先写点什么再发', 'err'); return; }
+    if (state.communityUploading > 0) { toast('还有图片在上传，稍等一下', 'err'); return; }
+    var images = (state.communityImages || []).map(function (img) { return img.url; });
+    if (!text && !images.length) { toast('先写点什么，或者加张图片', 'err'); return; }
     if (text.length > 1000) { toast('评论最多 1000 字', 'err'); return; }
-    var payload = { body: text };
+    var payload = { body: text, images: images };
     if (state.communityReply && state.communityReply.id) {
       payload.parent_comment_id = state.communityReply.id;
     }
@@ -2135,6 +2244,7 @@
       .then(function () {
         state.communityPosting = false;
         state.communityDraft = '';
+        state.communityImages = [];
         state.communityReply = null;
         toast('已发表到若道社区', 'ok');
         return loadCommunity(true);
@@ -2265,6 +2375,8 @@
     } else if (type === 'cancel-reply') {
       state.communityReply = null;
       renderCommunity();
+    } else if (type === 'remove-community-image') {
+      communityRemoveImage(action.dataset.index);
     } else if (type === 'delete-community') {
       deleteCommunity(action);
     } else if (type === 'refresh-community') {
@@ -2292,11 +2404,61 @@
         communityLogin(loginBtn);
       }
     });
+    document.addEventListener('change', function (event) {
+      var input = event.target;
+      if (!input || input.id !== 'communityImageInput') { return; }
+      // 必须先拷成数组：清空 value 会让 FileList 一起变空
+      var files = Array.prototype.slice.call(input.files || []);
+      input.value = '';
+      communityAddFiles(files);
+    });
+    document.addEventListener('paste', function (event) {
+      var target = event.target;
+      if (!target || target.id !== 'communityDraft') { return; }
+      var items = (event.clipboardData && event.clipboardData.items) || [];
+      var files = [];
+      for (var i = 0; i < items.length; i += 1) {
+        if (items[i].kind === 'file') {
+          var file = items[i].getAsFile();
+          if (file && /^image\//.test(file.type || '')) { files.push(file); }
+        }
+      }
+      if (files.length) {
+        event.preventDefault();
+        communityAddFiles(files);
+      }
+    });
+    document.addEventListener('dragover', function (event) {
+      if (!event.target.closest || !event.target.closest('#view-community')) { return; }
+      event.preventDefault();
+      if (!state.communityDrag) {
+        state.communityDrag = true;
+        renderCommunity();
+      }
+    });
+    document.addEventListener('dragleave', function (event) {
+      if (!state.communityDrag) { return; }
+      if (event.relatedTarget && event.relatedTarget.closest &&
+          event.relatedTarget.closest('#view-community')) { return; }
+      state.communityDrag = false;
+      renderCommunity();
+    });
+    document.addEventListener('drop', function (event) {
+      if (!event.target.closest || !event.target.closest('#view-community')) { return; }
+      event.preventDefault();
+      state.communityDrag = false;
+      var dt = event.dataTransfer;
+      if (dt && dt.files && dt.files.length) { communityAddFiles(dt.files); }
+      else { renderCommunity(); }
+    });
     document.addEventListener('input', function (event) {
       if (event.target && event.target.id === 'communityDraft') {
         state.communityDraft = event.target.value;
         var counter = $('#communityDraftCount');
-        if (counter) { counter.textContent = event.target.value.length + ' / 1000'; }
+        if (counter) {
+          counter.textContent = event.target.value.length + ' / 1000 · 图片 ' +
+            (state.communityImages || []).length + '/4';
+        }
       }
     });
     document.addEventListener('click', function (event) {

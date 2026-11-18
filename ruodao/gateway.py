@@ -12,7 +12,7 @@ import urllib.parse
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import util
+from . import __version__, util
 from .errors import UpstreamError
 from .protocols.responses import ResponseStore, ResponsesStreamTranslator
 from .protocols.translate import (
@@ -294,7 +294,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._serve_static(path)
                 return
             if path == "/health":
-                self._json(200, {"status": "ok", "version": "0.1.0",
+                self._json(200, {"status": "ok", "version": __version__,
                                  "time": int(time.time())})
                 return
             if path in ("/v1/models", "/models") and method == "GET":
@@ -1026,7 +1026,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             result = client.post(body.get("body"),
                                  body.get("parent_comment_id")
-                                 or body.get("parentCommentId") or "")
+                                 or body.get("parentCommentId") or "",
+                                 body.get("images") or [])
+            self._json(200, result)
+            return True
+        if path == "/api/community/upload" and method == "POST":
+            body = self._read_json()
+            result = client.upload_image(body.get("filename"),
+                                         body.get("content_type"),
+                                         body.get("data"))
             self._json(200, result)
             return True
         if path.startswith("/api/community/comments/") and method == "DELETE":

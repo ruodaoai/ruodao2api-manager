@@ -10,12 +10,14 @@
 接口与约定见 https://ruodao.com/open-source/docs 。
 """
 
+import base64
 import datetime
 import html as html_lib
 import re
 import threading
 import time
 import urllib.parse
+import uuid
 from html.parser import HTMLParser
 
 from . import util
@@ -30,6 +32,18 @@ PAGE_SIZE = 30
 MAX_BODY = 1000          # 服务端上限 1000 字
 POST_INTERVAL = 3.0      # 本机最小发帖间隔，避免误触连点
 AUTH_SETTING = "community_auth"
+
+MAX_IMAGES = 4           # 一条评论最多几张图
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+IMAGE_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+IMAGE_EXTS = ("png", "jpg", "jpeg", "webp", "gif")
+_IMG_TAG = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*(['\"])(.*?)\1", re.I | re.S)
 
 _BLOCK_TAGS = {
     "p", "div", "br", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -90,6 +104,45 @@ def html_to_text(raw, limit=MAX_BODY):
 
 def _clean_text(value, limit=200):
     return html_to_text(value, limit=limit) if value else ""
+
+
+def _guess_ext(filename, content_type):
+    name = str(filename or "").strip().lower()
+    if "." in name:
+        ext = name.rsplit(".", 1)[-1]
+        if ext in IMAGE_EXTS:
+            return "jpg" if ext == "jpeg" else ext
+    mapped = IMAGE_TYPES.get(str(content_type or "").strip().lower())
+    if mapped:
+        return mapped
+    return ""
+
+
+def _compose_body(text, images):
+    """把纯文本 + 图片地址拼成社区接受的小段 HTML（正文由站点自己清洗）。"""
+    parts = []
+    if text:
+        safe = html_lib.escape(text).replace("\n", "<br>")
+        parts.append("<p>%s</p>" % safe)
+    for url in images:
+        parts.append('<p><img src="%s" alt="comment image"></p>'
+                     % html_lib.escape(url, quote=True))
+    return "".join(parts)
+
+
+def _extract_images(raw_body, base):
+    found = []
+    for _quote, src in _IMG_TAG.findall(str(raw_body or "")):
+        url = html_lib.unescape(src).strip()
+        if not url:
+            continue
+        if url.startswith("/"):
+            url = base + url
+        if not re.match(r"^https?://", url, re.I):
+            continue
+        if url not in found:
+            found.append(url)
+    return found[:MAX_IMAGES]
 
 
 def _timestamp(value):
@@ -371,25 +424,128 @@ class CommunityClient(object):
             "id": str(raw.get("id") or ""),
             "author": _clean_text(raw.get("userDisplayName"), 40) or "社区用户",
             "body": html_to_text(raw.get("body")),
+            "images": _extract_images(raw.get("body"), self.base),
             "created_at": _timestamp(raw.get("createdAt")),
             "reply_to": _clean_text(raw.get("replyToUserDisplayName"), 40),
             "owner": bool(raw.get("owner")),
             "replies": replies,
         }
 
+    # -- 图片 ------------------------------------------------------------
+    def _safe_image_url(self, value):
+        """只接受本机这次上传换回来的图片地址，避免往评论里塞任意链接。"""
+        url = str(value or "").strip()
+        if not url:
+            return ""
+        if url.startswith("/"):
+            url = self.base + url
+        if not re.match(r"^https?://", url, re.I):
+            return ""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower()
+            base_host = (urllib.parse.urlparse(self.base).hostname or "").lower()
+        except Exception:
+            return ""
+        if not host:
+            return ""
+        trusted = host == base_host or host.endswith(".ruodao.com")
+        if not trusted and not parsed.path.startswith("/uploads/"):
+            return ""
+        return url
+
+    def upload_image(self, filename, content_type, data_b64):
+        """把一张图片转给若道的上传接口，返回可直接插进评论正文的地址。"""
+        token = self._token()
+        raw_name = str(filename or "").strip() or "image.png"
+        content_type = str(content_type or "").strip().lower()
+        payload_text = str(data_b64 or "").strip()
+        if payload_text.startswith("data:"):
+            head, _sep, payload_text = payload_text.partition(",")
+            if ";" in head and "base64" in head:
+                content_type = content_type or head[5:].split(";")[0]
+        if not payload_text:
+            raise UpstreamError("没有收到图片内容", status=400)
+        try:
+            blob = base64.b64decode(payload_text, validate=False)
+        except Exception:
+            raise UpstreamError("图片数据无法解析", status=400)
+        if not blob:
+            raise UpstreamError("没有收到图片内容", status=400)
+        if len(blob) > MAX_IMAGE_BYTES:
+            raise UpstreamError("单张图片不能超过 %d MB"
+                                % (MAX_IMAGE_BYTES // (1024 * 1024)),
+                                status=413)
+        ext = _guess_ext(raw_name, content_type)
+        if not ext:
+            raise UpstreamError("只支持 PNG、JPG、WebP、GIF 图片", status=400)
+        if not content_type or content_type not in IMAGE_TYPES:
+            content_type = "image/" + ("jpeg" if ext == "jpg" else ext)
+        safe_name = "%s.%s" % (re.sub(r"[^A-Za-z0-9_-]+", "-",
+                                      raw_name.rsplit(".", 1)[0])[:40] or "image",
+                              ext)
+
+        boundary = "----ruodao2api%s" % uuid.uuid4().hex
+        head = ("--%s\r\nContent-Disposition: form-data; name=\"file\"; "
+                "filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"
+                % (boundary, safe_name, content_type)).encode("utf-8")
+        body = head + blob + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+        status, obj, _raw = util.http_json(
+            "%s/api/uploads" % self.base, method="POST",
+            headers={"Authorization": "Bearer " + token,
+                     "Accept": "application/json",
+                     "Content-Type": "multipart/form-data; boundary=" + boundary,
+                     "User-Agent": util.DEFAULT_UA},
+            body=body, timeout=max(self.timeout, 30))
+        if status in (401, 403):
+            self._save_auth({})
+            raise UpstreamError("若道登录已失效，请重新登录", status=401)
+        if status != 200:
+            message = ""
+            if isinstance(obj, dict):
+                message = str(obj.get("message") or obj.get("errorCode") or "")
+            if status == 413:
+                message = message or "图片太大，若道服务器拒绝了这次上传"
+            raise UpstreamError(message or ("图片上传失败（HTTP %s）" % status),
+                                status=400 if status < 500 else 502)
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if not isinstance(data, dict):
+            data = obj if isinstance(obj, dict) else {}
+        url = self._safe_image_url(data.get("url") or data.get("fileUrl"))
+        if not url:
+            raise UpstreamError("图片上传成功但没有拿到地址", status=502)
+        self.log("INFO", "上传了一张评论图片（%d KB）" % max(1, len(blob) // 1024))
+        return {"ok": True, "url": url,
+                "name": str(data.get("name") or data.get("originalName")
+                            or safe_name),
+                "size": int(data.get("sizeBytes") or data.get("size")
+                            or len(blob))}
+
     # -- 写入 ------------------------------------------------------------
-    def post(self, body, parent_id=""):
+    def post(self, body, parent_id="", images=None):
         text = _clean_text(body, MAX_BODY + 1)
         if len(text) > MAX_BODY:
             raise UpstreamError("评论最多 %d 字" % MAX_BODY, status=400)
-        if not text:
+        urls = []
+        for item in (images or []):
+            if isinstance(item, dict):
+                item = item.get("url")
+            url = self._safe_image_url(item)
+            if not url:
+                # 地址对不上就整体拒绝，避免"图悄悄没了、只发出去一句话"
+                raise UpstreamError("有图片地址不可用，请重新上传后再发", status=400)
+            if url not in urls:
+                urls.append(url)
+        if len(urls) > MAX_IMAGES:
+            raise UpstreamError("一条评论最多 %d 张图片" % MAX_IMAGES, status=400)
+        if not text and not urls:
             raise UpstreamError("评论内容不能为空", status=400)
         now = time.time()
         with self._lock:
             if now - self._last_post < POST_INTERVAL:
                 raise UpstreamError("发言太快了，稍等一下再发", status=429)
         token = self._token()
-        payload = {"body": text}
+        payload = {"body": _compose_body(text, urls)}
         parent_id = str(parent_id or "").strip()
         if parent_id:
             payload["parentCommentId"] = parent_id
